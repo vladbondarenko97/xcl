@@ -1653,6 +1653,339 @@ pub(crate) mod tests {
         ENDPGM,
     ];
 
+    // f32 programs: the per-lane form refuses f32 so far, and `lower_dxil`'s
+    // `f32_programs_on_the_gpu` runs them on the HLSL path, checks its registers with the
+    // `check_f32_*` below (32 lanes) and compares the per-lane form with it where it lowers them
+
+    /// f32 VOP2 / VOP3 arithmetic on v1 = 2^lane and v2 = 2^lane · (1 + lane / 64), with the
+    /// VOP3 modifiers, and v19 = NaN (0x7FFFFFFF) into min / max / clamp. Every product is exact,
+    /// so `FMad` gives the same fused or not.
+    pub(crate) const F32_ARITHMETIC: &[I] = &[
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 192), ("VSRC1", 0)]),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 191), ("VSRC1", 1)]),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 151), ("VSRC1", 1)]),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 145), ("VSRC1", 0)]),
+        ("V_OR_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", V + 1), ("VSRC1", 2)]),
+        ("V_LSHRREV_B32", "ENC_VOP3", &[("VDST", 19), ("SRC0", 129), ("SRC1", 193)]),
+        // 0.5 + x, x - p, x - (-4), x · x, min / max(2, x)
+        ("V_ADD_F32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 240), ("VSRC1", 2)]),
+        ("V_SUB_F32", "ENC_VOP2", &[("VDST", 4), ("SRC0", V + 2), ("VSRC1", 1)]),
+        ("V_SUBREV_F32", "ENC_VOP2", &[("VDST", 5), ("SRC0", 247), ("VSRC1", 2)]),
+        ("V_MUL_F32", "ENC_VOP2", &[("VDST", 6), ("SRC0", V + 2), ("VSRC1", 2)]),
+        ("V_MIN_F32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 244), ("VSRC1", 2)]),
+        ("V_MAX_F32", "ENC_VOP2", &[("VDST", 8), ("SRC0", 244), ("VSRC1", 2)]),
+        // fma(x, -2, p), mad(x, 0.5, v3); mac v11 = 4 · x + p, fmac v12 = -0.5 · x + v3
+        ("V_FMA_F32", "ENC_VOP3", &[("VDST", 9), ("SRC0", V + 2), ("SRC1", 245), ("SRC2", V + 1)]),
+        ("V_MAD_F32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 2), ("SRC1", 240), ("SRC2", V + 3)]),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 11), ("SRC0", V + 1)]),
+        ("V_MAC_F32", "ENC_VOP2", &[("VDST", 11), ("SRC0", 246), ("VSRC1", 2)]),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 12), ("SRC0", V + 3)]),
+        ("V_FMAC_F32", "ENC_VOP2", &[("VDST", 12), ("SRC0", 241), ("VSRC1", 2)]),
+        // -|x| · |-4| (abs before neg); omod 0.5, 2, 4 (with neg on src2); clamp at 1 and at 0
+        ("V_MUL_F32", "ENC_VOP3", &[("VDST", 13), ("SRC0", V + 2), ("SRC1", 247), ("ABS", 3), ("NEG", 1)]),
+        ("V_ADD_F32", "ENC_VOP3", &[("VDST", 14), ("SRC0", V + 2), ("SRC1", V + 1), ("OMOD", 3)]),
+        ("V_SUB_F32", "ENC_VOP3", &[("VDST", 15), ("SRC0", V + 1), ("SRC1", V + 2), ("OMOD", 1)]),
+        ("V_FMA_F32", "ENC_VOP3", &[("VDST", 16), ("SRC0", V + 1), ("SRC1", V + 1), ("SRC2", V + 2), ("NEG", 4), ("OMOD", 2)]),
+        ("V_MUL_F32", "ENC_VOP3", &[("VDST", 17), ("SRC0", V + 4), ("SRC1", 240), ("CLAMP", 1)]),
+        ("V_FMA_F32", "ENC_VOP3", &[("VDST", 18), ("SRC0", V + 2), ("SRC1", 243), ("SRC2", 244), ("CLAMP", 1)]),
+        // min(NaN, x), max(x, -NaN), clamp(NaN · 1); VOP3 fmac v23 = |-0.5| · x + p
+        ("V_MIN_F32", "ENC_VOP2", &[("VDST", 20), ("SRC0", V + 19), ("VSRC1", 2)]),
+        ("V_MAX_F32", "ENC_VOP3", &[("VDST", 21), ("SRC0", V + 2), ("SRC1", V + 19), ("NEG", 2)]),
+        ("V_MUL_F32", "ENC_VOP3", &[("VDST", 22), ("SRC0", V + 19), ("SRC1", 242), ("CLAMP", 1)]),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 23), ("SRC0", V + 1)]),
+        ("V_FMAC_F32", "ENC_VOP3", &[("VDST", 23), ("SRC0", 241), ("SRC1", V + 2), ("ABS", 1)]),
+        ENDPGM,
+    ];
+
+    /// f32 compares of a = v3 (NaN in every fourth lane, 2^lane in the others) with 4.0: all 16
+    /// predicates into s[2k], two with VOP3 abs / neg, then VOPC into VCC and a cndmask of it,
+    /// and v_cmpx narrowing EXEC for a v_mov.
+    pub(crate) const F32_COMPARES: &[I] = &[
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 192), ("VSRC1", 0)]),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 191), ("VSRC1", 1)]),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 151), ("VSRC1", 1)]),
+        ("V_LSHRREV_B32", "ENC_VOP3", &[("VDST", 19), ("SRC0", 129), ("SRC1", 193)]),
+        ("V_AND_B32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 131), ("VSRC1", 0)]),
+        ("V_CMP_EQ_U32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 4)]),
+        ("V_CNDMASK_B32", "ENC_VOP2", &[("VDST", 3), ("SRC0", V + 1), ("VSRC1", 19)]),
+        ("V_CMP_F_F32", "ENC_VOP3", &[("VDST", 0), ("SRC0", V + 3), ("SRC1", 246)]),
+        ("V_CMP_LT_F32", "ENC_VOP3", &[("VDST", 2), ("SRC0", V + 3), ("SRC1", 246)]),
+        ("V_CMP_EQ_F32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V + 3), ("SRC1", 246)]),
+        ("V_CMP_LE_F32", "ENC_VOP3", &[("VDST", 6), ("SRC0", V + 3), ("SRC1", 246)]),
+        ("V_CMP_GT_F32", "ENC_VOP3", &[("VDST", 8), ("SRC0", V + 3), ("SRC1", 246)]),
+        ("V_CMP_LG_F32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 3), ("SRC1", 246)]),
+        ("V_CMP_GE_F32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 3), ("SRC1", 246)]),
+        ("V_CMP_O_F32", "ENC_VOP3", &[("VDST", 14), ("SRC0", V + 3), ("SRC1", 246)]),
+        ("V_CMP_U_F32", "ENC_VOP3", &[("VDST", 16), ("SRC0", V + 3), ("SRC1", 246)]),
+        ("V_CMP_NGE_F32", "ENC_VOP3", &[("VDST", 18), ("SRC0", V + 3), ("SRC1", 246)]),
+        ("V_CMP_NLG_F32", "ENC_VOP3", &[("VDST", 20), ("SRC0", V + 3), ("SRC1", 246)]),
+        ("V_CMP_NGT_F32", "ENC_VOP3", &[("VDST", 22), ("SRC0", V + 3), ("SRC1", 246)]),
+        ("V_CMP_NLE_F32", "ENC_VOP3", &[("VDST", 24), ("SRC0", V + 3), ("SRC1", 246)]),
+        ("V_CMP_NEQ_F32", "ENC_VOP3", &[("VDST", 26), ("SRC0", V + 3), ("SRC1", 246)]),
+        ("V_CMP_NLT_F32", "ENC_VOP3", &[("VDST", 28), ("SRC0", V + 3), ("SRC1", 246)]),
+        ("V_CMP_TRU_F32", "ENC_VOP3", &[("VDST", 30), ("SRC0", V + 3), ("SRC1", 246)]),
+        // -|a| == -4; !(|-2| > -a)
+        ("V_CMP_EQ_F32", "ENC_VOP3", &[("VDST", 32), ("SRC0", V + 3), ("SRC1", 247), ("ABS", 1), ("NEG", 1)]),
+        ("V_CMP_NGT_F32", "ENC_VOP3", &[("VDST", 34), ("SRC0", 245), ("SRC1", V + 3), ("ABS", 1), ("NEG", 2)]),
+        // vcc = a < 4, v6 = vcc ? p : 0; exec = a >= 4, v7 = 1.0 there
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 246)]),
+        ("V_CMP_LT_F32", "ENC_VOPC", &[("SRC0", V + 3), ("VSRC1", 5)]),
+        ("V_CNDMASK_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 128), ("VSRC1", 1)]),
+        ("V_CMPX_GE_F32", "ENC_VOPC", &[("SRC0", V + 3), ("VSRC1", 5)]),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 242)]),
+        ENDPGM,
+    ];
+
+    /// f32 ↔ i32 / u32 / f16 conversions: v2 = lane − 16, v4 = (lane << 26 | lane) rounded,
+    /// v6 = (lane − 16) / 4 into the f32 → integer ones, v11 = v4² (out of range) and v19 = NaN
+    /// into the saturating ones; binary16 in and out (denormals, ties to even, overflow, NaN),
+    /// with OP_SEL halves, omod and clamp.
+    pub(crate) const F32_CONVERSIONS: &[I] = &[
+        ("V_LSHRREV_B32", "ENC_VOP3", &[("VDST", 19), ("SRC0", 129), ("SRC1", 193)]),
+        ("V_SUBREV_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 144), ("VSRC1", 0)]),
+        ("V_CVT_F32_I32", "ENC_VOP1", &[("VDST", 2), ("SRC0", V + 1)]),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 154), ("VSRC1", 0)]),
+        ("V_OR_B32", "ENC_VOP2", &[("VDST", 3), ("SRC0", V), ("VSRC1", 3)]),
+        ("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 4), ("SRC0", V + 3)]),
+        ("V_CVT_F32_I32", "ENC_VOP3", &[("VDST", 5), ("SRC0", V + 1), ("OMOD", 3), ("CLAMP", 1)]),
+        ("V_MUL_F32", "ENC_VOP3", &[("VDST", 6), ("SRC0", V + 2), ("SRC1", 240), ("OMOD", 3)]),
+        ("V_CVT_I32_F32", "ENC_VOP1", &[("VDST", 7), ("SRC0", V + 6)]),
+        ("V_CVT_U32_F32", "ENC_VOP1", &[("VDST", 8), ("SRC0", V + 6)]),
+        ("V_CVT_RPI_I32_F32", "ENC_VOP1", &[("VDST", 9), ("SRC0", V + 6)]),
+        ("V_CVT_FLR_I32_F32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V + 6)]),
+        ("V_MUL_F32", "ENC_VOP2", &[("VDST", 11), ("SRC0", V + 4), ("VSRC1", 4)]),
+        ("V_CVT_I32_F32", "ENC_VOP1", &[("VDST", 12), ("SRC0", V + 11)]),
+        ("V_CVT_U32_F32", "ENC_VOP1", &[("VDST", 13), ("SRC0", V + 11)]),
+        ("V_CVT_I32_F32", "ENC_VOP3", &[("VDST", 14), ("SRC0", V + 11), ("NEG", 1)]),
+        ("V_CVT_U32_F32", "ENC_VOP1", &[("VDST", 15), ("SRC0", V + 19)]),
+        ("V_CVT_I32_F32", "ENC_VOP1", &[("VDST", 16), ("SRC0", V + 19)]),
+        // v17 = f16 (lane & 31) << 9 | (lane & 31), the lane in the high half; v20 = it in the
+        // high half, the lane in the low one
+        ("V_AND_B32", "ENC_VOP2", &[("VDST", 23), ("SRC0", 159), ("VSRC1", 0)]),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 17), ("SRC0", 137), ("VSRC1", 23)]),
+        ("V_OR_B32", "ENC_VOP2", &[("VDST", 17), ("SRC0", V + 23), ("VSRC1", 17)]),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 20), ("SRC0", 144), ("VSRC1", 17)]),
+        ("V_OR_B32", "ENC_VOP2", &[("VDST", 20), ("SRC0", V), ("VSRC1", 20)]),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 18), ("SRC0", 144), ("VSRC1", 0)]),
+        ("V_OR_B32", "ENC_VOP2", &[("VDST", 17), ("SRC0", V + 18), ("VSRC1", 17)]),
+        ("V_CVT_F32_F16", "ENC_VOP1", &[("VDST", 21), ("SRC0", V + 17)]),
+        ("V_CVT_F32_F16", "ENC_VOP3", &[("VDST", 22), ("SRC0", V + 20), ("OP_SEL", 1)]),
+        // v24 = 1 + (lane & 31) · 2^-14: f16 ties at lanes 8 and 24; into v25's low half
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 24), ("SRC0", 137), ("VSRC1", 23)]),
+        ("V_OR_B32", "ENC_VOP2", &[("VDST", 24), ("SRC0", 255), ("VSRC1", 24), ("LITERAL", 0x3F80_0000)]),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 25), ("SRC0", V + 20)]),
+        ("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 25), ("SRC0", V + 24)]),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 26), ("SRC0", V)]),
+        ("V_CVT_F16_F32", "ENC_VOP3", &[("VDST", 26), ("SRC0", V + 6), ("OP_SEL", 8)]),
+        // f16 denormals (· 2^-20), below the smallest one (· 2^-25), NaN, overflow, clamp
+        ("V_MUL_F32", "ENC_VOP2", &[("VDST", 28), ("SRC0", 255), ("VSRC1", 24), ("LITERAL", 0x3580_0000)]),
+        ("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 27), ("SRC0", V + 28)]),
+        ("V_MUL_F32", "ENC_VOP2", &[("VDST", 28), ("SRC0", 255), ("VSRC1", 24), ("LITERAL", 0x3300_0000)]),
+        ("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 29), ("SRC0", V + 28)]),
+        ("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 30), ("SRC0", V + 19)]),
+        ("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 31), ("SRC0", V + 11)]),
+        ("V_CVT_F16_F32", "ENC_VOP3", &[("VDST", 32), ("SRC0", V + 6), ("CLAMP", 1)]),
+        ENDPGM,
+    ];
+
+    /// floor / ceil / trunc / rndne / fract of v3 = (lane − 16) / 8 (ties, signed zeros), fract
+    /// of −2^-30 (just below 1.0), and two with VOP3 modifiers.
+    pub(crate) const F32_ROUNDING: &[I] = &[
+        ("V_SUBREV_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 144), ("VSRC1", 0)]),
+        ("V_CVT_F32_I32", "ENC_VOP1", &[("VDST", 2), ("SRC0", V + 1)]),
+        ("V_MUL_F32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 255), ("VSRC1", 2), ("LITERAL", 0x3E00_0000)]),
+        ("V_FLOOR_F32", "ENC_VOP1", &[("VDST", 4), ("SRC0", V + 3)]),
+        ("V_CEIL_F32", "ENC_VOP1", &[("VDST", 5), ("SRC0", V + 3)]),
+        ("V_TRUNC_F32", "ENC_VOP1", &[("VDST", 6), ("SRC0", V + 3)]),
+        ("V_RNDNE_F32", "ENC_VOP1", &[("VDST", 7), ("SRC0", V + 3)]),
+        ("V_FRACT_F32", "ENC_VOP1", &[("VDST", 8), ("SRC0", V + 3)]),
+        ("V_FRACT_F32", "ENC_VOP1", &[("VDST", 9), ("SRC0", 255), ("LITERAL", 0xB080_0000)]),
+        ("V_FLOOR_F32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 3), ("NEG", 1), ("OMOD", 1)]),
+        ("V_FRACT_F32", "ENC_VOP3", &[("VDST", 11), ("SRC0", V + 3), ("ABS", 1), ("CLAMP", 1)]),
+        ENDPGM,
+    ];
+
+    /// rcp / rsq / sqrt / log of v1 = 1 + (lane & 31) / 32, exp / sin / cos of v2 = v1 − 1.5,
+    /// and three with VOP3 modifiers (log2 |0| = −∞ at lane 16). The GPU's are approximate.
+    pub(crate) const F32_TRANSCENDENTALS: &[I] = &[
+        ("V_AND_B32", "ENC_VOP2", &[("VDST", 23), ("SRC0", 159), ("VSRC1", 0)]),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 146), ("VSRC1", 23)]),
+        ("V_OR_B32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 255), ("VSRC1", 1), ("LITERAL", 0x3F80_0000)]),
+        ("V_ADD_F32", "ENC_VOP3", &[("VDST", 2), ("SRC0", V + 1), ("SRC1", 243)]),
+        ("V_ADD_F32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 241), ("VSRC1", 2)]),
+        ("V_RCP_F32", "ENC_VOP1", &[("VDST", 3), ("SRC0", V + 1)]),
+        ("V_RCP_IFLAG_F32", "ENC_VOP1", &[("VDST", 4), ("SRC0", V + 1)]),
+        ("V_RSQ_F32", "ENC_VOP1", &[("VDST", 5), ("SRC0", V + 1)]),
+        ("V_SQRT_F32", "ENC_VOP1", &[("VDST", 6), ("SRC0", V + 1)]),
+        ("V_EXP_F32", "ENC_VOP1", &[("VDST", 7), ("SRC0", V + 2)]),
+        ("V_LOG_F32", "ENC_VOP1", &[("VDST", 8), ("SRC0", V + 1)]),
+        ("V_SIN_F32", "ENC_VOP1", &[("VDST", 9), ("SRC0", V + 2)]),
+        ("V_COS_F32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V + 2)]),
+        ("V_EXP_F32", "ENC_VOP3", &[("VDST", 11), ("SRC0", V + 2), ("NEG", 1), ("OMOD", 1)]),
+        ("V_SIN_F32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 2), ("CLAMP", 1)]),
+        ("V_LOG_F32", "ENC_VOP3", &[("VDST", 13), ("SRC0", V + 2), ("ABS", 1)]),
+        ENDPGM,
+    ];
+
+    /// v_fmamk / fmaak / madmk / madak (products exact) and min3 / max3 / med3 of a = the lane
+    /// (NaN in every fourth lane), b = lane − 16 and 4.0, one with VOP3 abs / neg.
+    pub(crate) const F32_THREE_SOURCE: &[I] = &[
+        ("V_LSHRREV_B32", "ENC_VOP3", &[("VDST", 19), ("SRC0", 129), ("SRC1", 193)]),
+        ("V_SUBREV_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 144), ("VSRC1", 0)]),
+        ("V_CVT_F32_I32", "ENC_VOP1", &[("VDST", 2), ("SRC0", V + 1)]),
+        ("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 3), ("SRC0", V)]),
+        ("V_AND_B32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 131), ("VSRC1", 0)]),
+        ("V_CMP_EQ_U32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 4)]),
+        ("V_CNDMASK_B32", "ENC_VOP2", &[("VDST", 5), ("SRC0", V + 3), ("VSRC1", 19)]),
+        ("V_FMAMK_F32", "ENC_VOP2", &[("VDST", 6), ("SRC0", V + 3), ("VSRC1", 2), ("LITERAL", 0x3FC0_0000)]),
+        ("V_FMAAK_F32", "ENC_VOP2", &[("VDST", 7), ("SRC0", V + 3), ("VSRC1", 2), ("LITERAL", 0x3E80_0000)]),
+        ("V_MADMK_F32", "ENC_VOP2", &[("VDST", 8), ("SRC0", V + 3), ("VSRC1", 2), ("LITERAL", 0x3FC0_0000)]),
+        ("V_MADAK_F32", "ENC_VOP2", &[("VDST", 9), ("SRC0", V + 3), ("VSRC1", 2), ("LITERAL", 0x3E80_0000)]),
+        ("V_MIN3_F32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 5), ("SRC1", V + 2), ("SRC2", 246)]),
+        ("V_MAX3_F32", "ENC_VOP3", &[("VDST", 11), ("SRC0", V + 5), ("SRC1", V + 2), ("SRC2", 246)]),
+        ("V_MED3_F32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 5), ("SRC1", V + 2), ("SRC2", 246)]),
+        ("V_MED3_F32", "ENC_VOP3", &[("VDST", 13), ("SRC0", V + 2), ("SRC1", V + 5), ("SRC2", 246), ("ABS", 1), ("NEG", 2)]),
+        ENDPGM,
+    ];
+
+    pub(crate) fn check_f32_arithmetic(_: &[u32], v: &[Vec<u32>]) {
+        let sat = |x: f32| x.clamp(0.0, 1.0);
+        for (l, r) in v.iter().enumerate() {
+            let f = |i: usize| f32::from_bits(r[i]);
+            let (p, x) = (f(1), f(2));
+            assert_eq!((p, x), (2f32.powi(l as i32), 2f32.powi(l as i32) * (1.0 + l as f32 / 64.0)), "lane {l}");
+            let y = x + 0.5;
+            let want = [y, x - p, x + 4.0, x * x, x.min(2.0), x.max(2.0), x * -2.0 + p, x * 0.5 + y, 4.0 * x + p, -0.5 * x + y, -x * 4.0, (x + p) * 0.5, (p - x) * 2.0, (p * p - x) * 4.0, sat((x - p) * 0.5), sat(2.0 - x)];
+            for (i, w) in want.iter().enumerate() {
+                assert_eq!(f(3 + i).to_bits(), w.to_bits(), "lane {l} v{}: {} against {w}", 3 + i, f(3 + i));
+            }
+            assert_eq!((r[20], r[21], r[22]), (r[2], r[2], 0), "lane {l}: NaN into min, max, clamp");
+            assert_eq!(f(23), 0.5 * x + p, "lane {l}: VOP3 fmac");
+        }
+    }
+
+    pub(crate) fn check_f32_compares(s: &[u32], v: &[Vec<u32>]) {
+        let preds: [fn(f32, f32) -> bool; 18] = [
+            |_, _| false,
+            |a, b| a < b,
+            |a, b| a == b,
+            |a, b| a <= b,
+            |a, b| a > b,
+            |a, b| a < b || a > b,
+            |a, b| a >= b,
+            |a, b| !a.is_nan() && !b.is_nan(),
+            |a, b| a.is_nan() || b.is_nan(),
+            |a, b| !(a >= b),
+            |a, b| !(a < b || a > b),
+            |a, b| !(a > b),
+            |a, b| !(a <= b),
+            |a, b| !(a == b),
+            |a, b| !(a < b),
+            |_, _| true,
+            |a, _| -a.abs() == -4.0,
+            |a, _| !(2.0 > -a),
+        ];
+        let a: Vec<f32> = (0..32).map(|l| if l % 4 == 0 { f32::from_bits(0x7FFF_FFFF) } else { 2f32.powi(l) }).collect();
+        let mask = |p: &dyn Fn(f32) -> bool| (0..32).filter(|&l| p(a[l])).fold(0u32, |m, l| m | 1 << l);
+        for (k, p) in preds.iter().enumerate() {
+            assert_eq!(s[2 * k], mask(&|x| p(x, 4.0)), "s{}", 2 * k);
+        }
+        assert_eq!(s[106], mask(&|x| x < 4.0), "vcc");
+        assert_eq!(s[126], mask(&|x| x >= 4.0), "exec");
+        for (l, r) in v.iter().enumerate() {
+            assert_eq!(r[3], a[l].to_bits(), "lane {l}");
+            assert_eq!(r[6], if a[l] < 4.0 { r[1] } else { 0 }, "lane {l}: cndmask");
+            assert_eq!(r[7], if a[l] >= 4.0 { 1f32.to_bits() } else { 0 }, "lane {l}: under v_cmpx");
+        }
+    }
+
+    pub(crate) fn check_f32_conversions(_: &[u32], v: &[Vec<u32>]) {
+        for (l, r) in v.iter().enumerate() {
+            let f = |i: usize| f32::from_bits(r[i]);
+            let (li, q) = (l as i32 - 16, (l as i32 - 16) as f32 / 4.0);
+            assert_eq!(f(2), li as f32, "lane {l}");
+            assert_eq!(f(4), ((l as u32) << 26 | l as u32) as f32, "lane {l}: u32 rounded to nearest even");
+            assert_eq!(f(5), (li as f32 * 0.5).clamp(0.0, 1.0), "lane {l}: omod and clamp");
+            assert_eq!(f(6), q, "lane {l}");
+            // the HLSL path's cvt_i32 / cvt_u32 saturate as Rust's `as` does, NaN giving 0
+            assert_eq!((r[7], r[8]), (q as i32 as u32, q as u32), "lane {l}: truncated");
+            assert_eq!((r[9], r[10]), ((q + 0.5).floor() as i32 as u32, q.floor() as i32 as u32), "lane {l}: rpi, flr");
+            assert_eq!((r[12], r[13], r[14]), (f(11) as i32 as u32, f(11) as u32, (-f(11)) as i32 as u32), "lane {l}: out of range");
+            assert_eq!((r[15], r[16]), (0, 0), "lane {l}: NaN");
+            assert_eq!(f(21), f16_to_f32(r[17] & 0xFFFF), "lane {l}");
+            assert_eq!(r[22], r[21], "lane {l}: the high half");
+            assert_eq!(r[25] >> 16, r[20] >> 16, "lane {l}: the half kept");
+            assert_eq!(r[26] & 0xFFFF, l as u32, "lane {l}: the half kept");
+            assert_eq!(r[29], (l != 0) as u32, "lane {l}: below the smallest denormal");
+            assert_eq!(r[30], 0x7FFF, "lane {l}: NaN");
+            assert_eq!(r[31], if l == 0 { 0 } else { 0x7C00 }, "lane {l}: overflow");
+        }
+        let lo = |l: usize, i: usize| v[l][i] & 0xFFFF;
+        assert_eq!([lo(0, 21), lo(1, 17), lo(30, 17)], [0, 0x0201, 0x3C1E]);
+        assert_eq!((f32::from_bits(v[1][21]), f32::from_bits(v[30][21])), (513.0 * 2f32.powi(-24), 1.0 + 30.0 / 1024.0), "f16 in");
+        // 1 + k · 2^-14 at k = 1, 8, 16, 24, 31: ties to even at 8 and 24
+        assert_eq!([1, 8, 16, 24, 31].map(|l| lo(l, 25)), [0x3C00, 0x3C00, 0x3C01, 0x3C02, 0x3C02]);
+        assert_eq!([0, 16, 18, 20].map(|l| v[l][26] >> 16), [0xC400, 0, 0x3800, 0x3C00], "f16 into the high half");
+        assert_eq!([0, 18, 20, 31].map(|l| lo(l, 32)), [0, 0x3800, 0x3C00, 0x3C00], "clamp");
+        assert_eq!(lo(0, 27), 0x0010, "2^-20: an f16 denormal");
+    }
+
+    pub(crate) fn check_f32_rounding(_: &[u32], v: &[Vec<u32>]) {
+        for (l, r) in v.iter().enumerate() {
+            let x = (l as i32 - 16) as f32 / 8.0;
+            let want = [x.floor(), x.ceil(), x.trunc(), x.round_ties_even(), x - x.floor()];
+            for (i, w) in want.iter().enumerate() {
+                assert_eq!(r[4 + i], w.to_bits(), "lane {l} v{}", 4 + i);
+            }
+            assert_eq!(r[9], 0x3F7F_FFFF, "fract(-2^-30): below 1.0");
+            assert_eq!(f32::from_bits(r[10]), 2.0 * (-x).floor(), "lane {l}");
+            assert_eq!(f32::from_bits(r[11]), x.abs() - x.abs().floor(), "lane {l}");
+        }
+    }
+
+    pub(crate) fn check_f32_three_source(_: &[u32], v: &[Vec<u32>]) {
+        let med3 = |a: f32, b: f32, c: f32| a.min(b).max(a.max(b).min(c));
+        for (l, r) in v.iter().enumerate() {
+            let f = |i: usize| f32::from_bits(r[i]);
+            let (x, y) = (l as f32, l as f32 - 16.0);
+            let a = if l % 4 == 0 { f32::from_bits(0x7FFF_FFFF) } else { x };
+            assert_eq!([f(6), f(7), f(8), f(9)], [x * 1.5 + y, x * y + 0.25, x * 1.5 + y, x * y + 0.25], "lane {l}");
+            assert_eq!([f(10), f(11), f(12)], [a.min(y).min(4.0), a.max(y).max(4.0), med3(a, y, 4.0)], "lane {l}");
+            assert_eq!(f(13), med3(y.abs(), -a, 4.0), "lane {l}");
+        }
+    }
+
+    pub(crate) fn check_f32_transcendentals(_: &[u32], v: &[Vec<u32>]) {
+        let sat = |x: f32| x.clamp(0.0, 1.0);
+        for (l, r) in v.iter().enumerate() {
+            let x = 1.0 + (l & 31) as f32 / 32.0;
+            let y = x - 1.5;
+            let t = y * 6.283_185_3;
+            assert_eq!((r[1], r[2]), (x.to_bits(), y.to_bits()), "lane {l}");
+            let want = [1.0 / x, 1.0 / x, 1.0 / x.sqrt(), x.sqrt(), y.exp2(), x.log2(), t.sin(), t.cos(), 2.0 * (-y).exp2(), sat(t.sin()), y.abs().log2()];
+            for (i, w) in want.iter().enumerate() {
+                assert!(f32_close(r[3 + i], w.to_bits()), "lane {l} v{}: {} against {w}", 3 + i, f32::from_bits(r[3 + i]));
+            }
+        }
+    }
+
+    /// The same bits, or within `approximate_float_unary_ops_are_within_tolerance`'s tolerance.
+    pub(crate) fn f32_close(a: u32, b: u32) -> bool {
+        let (a, b) = (f32::from_bits(a), f32::from_bits(b));
+        a.to_bits() == b.to_bits() || (a - b).abs() <= 1e-3f32.max(b.abs() * 1e-5)
+    }
+
+    /// binary16 in the low 16 bits → f32 (`f16tof32`)
+    pub(crate) fn f16_to_f32(h: u32) -> f32 {
+        let (s, e, m) = (h >> 15 & 1, h >> 10 & 0x1F, h & 0x3FF);
+        let v = match e {
+            0 => m as f32 * 2f32.powi(-24),
+            31 => f32::from_bits(0x7F80_0000 | m << 13),
+            _ => f32::from_bits((e + 112) << 23 | m << 13),
+        };
+        if s == 1 { -v } else { v }
+    }
+
     pub(crate) fn compute_cs() -> crate::gpu::recomp::CsInterface {
         crate::gpu::recomp::CsInterface { threads: [64, 1, 1], user_sgprs: 2, tgid: [true, false, false], tg_size: false, tid_components: 1 }
     }
@@ -1725,8 +2058,15 @@ pub(crate) mod tests {
         (0..256).map(|i| 1000 + i).collect()
     }
 
+    /// A line's bytes; a `("LITERAL", k)` field is the instruction's literal dword.
+    pub(crate) fn encode_line((n, e, f): &I) -> Vec<u8> {
+        let lit = f.iter().find(|(k, _)| *k == "LITERAL").map(|&(_, v)| v as u32);
+        let f: Vec<(&str, u64)> = f.iter().copied().filter(|(k, _)| *k != "LITERAL").collect();
+        rdna2::encode(n, e, &f, lit).unwrap()
+    }
+
     pub(crate) fn decode(lines: &[I]) -> Vec<Decoded> {
-        let bytes: Vec<u8> = lines.iter().flat_map(|(n, e, f)| rdna2::encode(n, e, f, None).unwrap()).collect();
+        let bytes: Vec<u8> = lines.iter().flat_map(encode_line).collect();
         let mut out = Vec::new();
         let mut off = 0;
         while off < bytes.len() {
