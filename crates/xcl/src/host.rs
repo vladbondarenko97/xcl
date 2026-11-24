@@ -73,6 +73,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     mb(pools as u64),
                     mb(pools_mapped as u64)
                 );
+                crate::xlog_info!("{}", crate::hle::d3d12x::costs::line());
                 last = now;
             }
         });

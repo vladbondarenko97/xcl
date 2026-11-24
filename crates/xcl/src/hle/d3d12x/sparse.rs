@@ -398,6 +398,14 @@ unsafe impl Send for State {}
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
+/// Signals the sparse queue has been given and the GPU has not done (None: busy, or no state)
+/// – `XCL_ACTIVITY`
+pub fn queue_lag() -> Option<u64> {
+    let g = STATE.try_lock().ok()?;
+    let s = g.as_ref()?;
+    Some(s.value.saturating_sub(unsafe { s.fence.GetCompletedValue() }))
+}
+
 /// The state's queue again, outside `STATE` (`queue`). `STATE` is held around D3D12 calls (an
 /// upload's allocator `Reset` in `begin_slot`), and `late_release` asks for the queue from a
 /// resource's last `Release`, which D3D12 can make inside a call of its own on another thread
@@ -763,6 +771,7 @@ impl State {
                 counts.push(run);
                 i += run as usize;
             }
+            let utm_t = std::time::Instant::now();
             self.queue.UpdateTileMappings(
                 res,
                 coords.len() as u32,
@@ -775,6 +784,7 @@ impl State {
                 Some(counts.as_ptr()),
                 D3D12_TILE_MAPPING_FLAG_NONE,
             );
+            super::costs::UTM_SPARSE.add(utm_t.elapsed());
         }
     }
 
@@ -801,6 +811,7 @@ impl State {
             counts.push(run);
             i += run as usize;
         }
+        let utm_t = std::time::Instant::now();
         self.queue.UpdateTileMappings(
             res,
             coords.len() as u32,
@@ -813,6 +824,7 @@ impl State {
             Some(counts.as_ptr()),
             D3D12_TILE_MAPPING_FLAG_NONE,
         );
+        super::costs::UTM_SPARSE.add(utm_t.elapsed());
     }
 
     /// tiles of `[a, a + n)` get video memory (mapped in their window); `initial_holes` supplies

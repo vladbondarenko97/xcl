@@ -455,6 +455,13 @@ unsafe impl Send for Pages {}
 /// device raw pointer → its pages (None inside: tiled tier < 2 on this device)
 static PAGES: Mutex<std::collections::BTreeMap<usize, Option<Pages>>> = Mutex::new(std::collections::BTreeMap::new());
 
+/// Mappings the pages queue has been given and the GPU has not done (None: busy, or no pages)
+/// – `XCL_ACTIVITY`
+pub fn queue_lag() -> Option<u64> {
+    let g = PAGES.try_lock().ok()?;
+    g.values().flatten().map(|p| p.value.saturating_sub(unsafe { p.fence.GetCompletedValue() })).max()
+}
+
 impl Pages {
     unsafe fn new(dev: &ID3D12Device) -> Option<Pages> {
         let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
@@ -524,6 +531,7 @@ impl Pages {
             }
             let coord = D3D12_TILED_RESOURCE_COORDINATE::default();
             let region = D3D12_TILE_REGION_SIZE { NumTiles: num_tiles, UseBox: false.into(), ..Default::default() };
+            let utm_t = std::time::Instant::now();
             self.queue.UpdateTileMappings(
                 res,
                 1,
@@ -536,6 +544,7 @@ impl Pages {
                 Some(self.scratch_counts.as_ptr()),
                 D3D12_TILE_MAPPING_FLAG_NONE,
             );
+            super::costs::UTM_PAGES.add(utm_t.elapsed());
         }
         self.value += 1;
         let _ = self.queue.Signal(&self.fence, self.value);
@@ -550,6 +559,7 @@ impl Pages {
         let coord = D3D12_TILED_RESOURCE_COORDINATE::default();
         let region = D3D12_TILE_REGION_SIZE { NumTiles: total, UseBox: false.into(), ..Default::default() };
         let flag = D3D12_TILE_RANGE_FLAG_NULL;
+        let utm_t = std::time::Instant::now();
         self.queue.UpdateTileMappings(
             res,
             1,
@@ -562,6 +572,7 @@ impl Pages {
             Some(&total),
             D3D12_TILE_MAPPING_FLAG_NONE,
         );
+        super::costs::UTM_PAGES.add(utm_t.elapsed());
         self.value += 1;
         let _ = self.queue.Signal(&self.fence, self.value);
     }

@@ -111,6 +111,12 @@ pub(super) fn pending_summary() -> String {
     }
 }
 
+/// The most signals one title fence is behind (signalled value − completed value) – `XCL_ACTIVITY`
+pub(super) fn backlog() -> u64 {
+    let g = FENCES.lock().unwrap_or_else(|e| e.into_inner());
+    g.iter().flatten().map(|(&p, f)| f.signalled.saturating_sub(unsafe { borrowed(p, |f| f.GetCompletedValue()) }.unwrap_or(f.signalled))).max().unwrap_or(0)
+}
+
 /// fence #12: the address of its completed value
 pub(super) unsafe extern "system" fn completed_value_address(this: *mut c_void) -> *const u64 {
     let (cell, pending) = {

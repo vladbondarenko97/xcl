@@ -840,7 +840,7 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             // retail title's video planes and UI targets went up again for every submit, ~25 MB
             // a presented frame where ~3 MB had changed, and the submits waited here.
             if unchanged_skip() {
-                let h = content_hash(&title_bytes(va, tex.size() as usize));
+                let h = super::costs::HASH.time(|| content_hash(&title_bytes(va, tex.size() as usize)));
                 if same_as_last_upload(r.as_raw() as usize, h) {
                     let n = UNCHANGED.fetch_add(1, Ordering::Relaxed) + 1;
                     if n == 1 || (n.is_power_of_two() && n >= 1024) {
@@ -853,7 +853,8 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             bytes += tex.size() as usize;
             picked.push((r, va, tex, states));
         }
-        let subs = subresources_of_all(&picked, bytes);
+        let subs = super::costs::DETILE.time(|| subresources_of_all(&picked, bytes));
+        super::costs::UPLOAD_MB.fetch_add((bytes >> 20) as u64, Ordering::Relaxed);
         let mut batch = Vec::with_capacity(picked.len());
         for ((r, va, _, states), subs) in picked.into_iter().zip(subs) {
             if super::present::trace_frame() {
@@ -870,10 +871,10 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
                 continue;
             }
         };
-        match own_work(|| {
+        match super::costs::UPLOAD.time(|| own_work(|| {
             super::vram::before_execute(&queue);
             texture::upload_batch(dev, &queue, &batch)
-        }) {
+        })) {
             Ok(failed) => {
                 for (_, e) in failed {
                     warn(&e);
