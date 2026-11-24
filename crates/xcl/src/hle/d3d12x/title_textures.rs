@@ -853,16 +853,28 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             bytes += tex.size() as usize;
             picked.push((r, va, tex, states));
         }
-        let subs = subresources_of_all(&picked, bytes);
-        let mut batch = Vec::with_capacity(picked.len());
-        for ((r, va, _, states), subs) in picked.into_iter().zip(subs) {
-            if super::present::trace_frame() {
-                note_content(va, &r, &subs);
-            }
-            batch.push((r, subs, states));
-        }
         let d = device as *mut c_void;
         let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { continue };
+        // detiled on the GPU where the device has the pipeline and the texture fits the plan
+        // (not while tracing frames: that looks at the detiled bytes), the rest on the CPU
+        let gpu = !super::present::trace_frame() && crate::gpu::detile_gpu::pipe(dev).is_some();
+        let tiled: Vec<_> = picked.iter().map(|(_, va, tex, _)| if gpu { plan_gpu(*va, tex) } else { None }).collect();
+        let on_cpu: Vec<_> = picked.iter().zip(&tiled).filter(|(_, t)| t.is_none()).map(|(p, _)| p.clone()).collect();
+        let cpu_bytes = on_cpu.iter().map(|p| p.2.size() as usize).sum();
+        let mut cpu_subs = subresources_of_all(&on_cpu, cpu_bytes).into_iter();
+        let mut batch = Vec::with_capacity(picked.len());
+        for ((r, va, _, states), t) in picked.into_iter().zip(tiled) {
+            match t {
+                Some((dims, t)) => batch.push((r, dims, states, Some(t))),
+                None => {
+                    let subs = cpu_subs.next().unwrap_or_default();
+                    if super::present::trace_frame() {
+                        note_content(va, &r, &subs);
+                    }
+                    batch.push((r, subs, states, None));
+                }
+            }
+        }
         let queue = match upload_queue(dev, device) {
             Ok(q) => q,
             Err(e) => {
@@ -872,7 +884,8 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
         };
         match own_work(|| {
             super::vram::before_execute(&queue);
-            texture::upload_batch(dev, &queue, &batch)
+            let items: Vec<texture::BatchItem> = batch.iter().map(|(r, subs, states, t)| (r, subs.as_slice(), states.as_slice(), t.as_ref())).collect();
+            texture::upload_batch_with(dev, &queue, &items)
         }) {
             Ok(failed) => {
                 for (_, e) in failed {
@@ -1164,6 +1177,19 @@ unsafe fn title_bytes(at: usize, len: usize) -> std::borrow::Cow<'static, [u8]> 
     } else {
         std::borrow::Cow::Owned(read_committed(at, len))
     }
+}
+
+/// The GPU detile of a texture at `va` (`detile_gpu::plan`) and its subresources' sizes (D3D12
+/// order, no data); `None`: detiled on the CPU (`subresources`).
+unsafe fn plan_gpu(va: usize, tex: &xg::Texture) -> Option<(Vec<Subresource>, crate::gpu::detile_gpu::Tiled)> {
+    let tex = tex.texels()?;
+    let c = &tex.chain;
+    let bpe = tex.bpe as usize;
+    let volume = tex.depth > 0;
+    let array = if volume { 1 } else { tex.array as usize };
+    let t = crate::gpu::detile_gpu::plan(c, bpe, array, volume, read_committed(va, tex.size() as usize))?;
+    let dims = (0..array).flat_map(|_| c.levels.iter().map(|l| Subresource { depth: if volume { l.depth } else { 1 }, rows: l.height, row_bytes: l.width * bpe, data: Vec::new() })).collect();
+    Some((dims, t))
 }
 
 /// Every subresource (D3D12 order) of a texture from the title's memory at `va`.

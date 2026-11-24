@@ -5,6 +5,7 @@ pub mod adapter;
 pub mod agility;
 pub mod bvh;
 pub mod desc;
+pub mod detile_gpu;
 pub mod dxbc;
 pub mod dxil;
 pub(crate) mod fence;

@@ -213,6 +213,8 @@ struct Uploader {
     value: u64,
     /// (buffer, its mapped bytes, capacity)
     staging: Option<(ID3D12Resource, *mut u8, u64)>,
+    /// (default-heap UAV buffer the GPU detiles into, capacity)
+    scratch: Option<(ID3D12Resource, u64)>,
 }
 
 // D3D12 objects are free-threaded; the mapped pointer is only used by the holder of the uploader
@@ -231,7 +233,7 @@ impl Uploader {
         let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(err)?;
         list.Close().map_err(err)?;
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
-        Ok(Uploader { alloc, list, fence, value: 0, staging: None })
+        Ok(Uploader { alloc, list, fence, value: 0, staging: None, scratch: None })
     }
 
     /// An upload buffer of at least `bytes`, mapped: the one kept, or a bigger one.
@@ -248,6 +250,33 @@ impl Uploader {
         self.staging = Some((b.clone(), p as *mut u8, cap));
         Ok((b, p as *mut u8))
     }
+
+    /// A default-heap buffer the GPU can write (UAV) of at least `bytes`: the one kept, or a
+    /// bigger one. It is in the common state between batches.
+    unsafe fn scratch(&mut self, dev: &ID3D12Device, bytes: u64) -> Result<ID3D12Resource, String> {
+        if let Some((b, cap)) = &self.scratch {
+            if *cap >= bytes {
+                return Ok(b.clone());
+            }
+        }
+        let cap = bytes.max(STAGING_MIN).next_power_of_two();
+        let rd = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: cap,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut r: Option<ID3D12Resource> = None;
+        dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, None, &mut r).map_err(err)?;
+        let b = r.ok_or("scratch buffer: none made")?;
+        self.scratch = Some((b.clone(), cap));
+        Ok(b)
+    }
 }
 
 /// Several uploads on one list, one wait: (resource, subresources, states) each – the states
@@ -255,6 +284,19 @@ impl Uploader {
 /// order). A failure of one is returned with its index; the others still run. The texels go
 /// through the queue's kept upload buffer (`Uploader`).
 pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)]) -> Result<Vec<(usize, String)>, String> {
+    let items: Vec<BatchItem> = items.iter().map(|(r, subs, states)| (r, subs.as_slice(), states.as_slice(), None)).collect();
+    upload_batch_with(dev, queue, &items)
+}
+
+/// One texture of `upload_batch_with`: (resource, subresources, states, its tiled bytes to
+/// detile on the GPU – then the subresources give only their sizes, no data).
+pub type BatchItem<'a> = (&'a ID3D12Resource, &'a [Subresource], &'a [D3D12_RESOURCE_STATES], Option<&'a super::detile_gpu::Tiled>);
+
+/// `upload_batch` where textures may come tiled (`BatchItem`): their bytes and tables go to the
+/// upload buffer as they are, a compute pass (`detile_gpu`) writes their rows into the
+/// uploader's scratch buffer and their copies read from there. A tiled texture without the
+/// device's detile pipeline fails (the caller asks `detile_gpu::pipe` first).
+pub unsafe fn upload_batch_with(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items: &[BatchItem]) -> Result<Vec<(usize, String)>, String> {
     if items.is_empty() {
         return Ok(Vec::new());
     }
@@ -266,15 +308,31 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
     };
     // where each texture's texels go in the upload buffer
     let mut failed = Vec::new();
+    // (item, layout, base in the upload buffer (rows) or in the scratch buffer (tiled), where a
+    // tiled one's bytes and tables are in the upload buffer)
     let mut planned = Vec::with_capacity(items.len());
     let mut total = 0u64;
-    for (k, (res, subs, states)) in items.iter().enumerate() {
-        match layout(dev, res, subs, states, states) {
-            Ok(l) => {
-                let base = total.div_ceil(PLACEMENT) * PLACEMENT;
-                total = base + l.total;
-                planned.push((k, l, base));
-            }
+    let mut scratch_total = 0u64;
+    let pipe = if items.iter().any(|i| i.3.is_some()) { super::detile_gpu::pipe(dev) } else { None };
+    for (k, (res, subs, states, tiled)) in items.iter().enumerate() {
+        match layout(dev, res, subs, states, states, tiled.is_none()) {
+            Ok(_) if tiled.is_some() && pipe.is_none() => failed.push((k, "no GPU detile pipeline".to_string())),
+            Ok(l) => match tiled {
+                None => {
+                    let base = total.div_ceil(PLACEMENT) * PLACEMENT;
+                    total = base + l.total;
+                    planned.push((k, l, base, (0, 0)));
+                }
+                Some(t) => {
+                    let base = scratch_total.div_ceil(PLACEMENT) * PLACEMENT;
+                    // a row's last dword may run up to 3 B past its bytes
+                    scratch_total = base + l.total + 4;
+                    let raw_at = total.div_ceil(256) * 256;
+                    let tab_at = (raw_at + t.raw.len() as u64).div_ceil(256) * 256;
+                    total = tab_at + 4 * t.tables.len() as u64;
+                    planned.push((k, l, base, (raw_at, tab_at)));
+                }
+            },
             Err(e) => failed.push((k, e)),
         }
     }
@@ -282,12 +340,40 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
         put_back(key, up);
         return Ok(failed);
     }
+    if total >= 1 << 32 || scratch_total >= 1 << 32 {
+        put_back(key, up);
+        return Err(format!("texture batch too big for one upload ({total} B, {scratch_total} B detiled)"));
+    }
     let (staging, mapped) = up.staging(dev, total)?;
+    let scratch = if scratch_total > 0 { Some(up.scratch(dev, scratch_total)?) } else { None };
     up.alloc.Reset().map_err(err)?;
     up.list.Reset(&up.alloc, None).map_err(err)?;
-    for (k, l, base) in &planned {
-        let (res, subs, states) = &items[*k];
-        record_into(&up.list, res, subs, l, states, states, &staging, mapped, *base);
+    if let (Some(scratch), Some(pipe)) = (&scratch, &pipe) {
+        // the tiled textures: bytes and tables into the upload buffer, then one compute pass
+        let list = &up.list;
+        list.SetComputeRootSignature(&pipe.root);
+        list.SetPipelineState(&pipe.pso);
+        list.SetComputeRootShaderResourceView(1, staging.GetGPUVirtualAddress());
+        list.SetComputeRootShaderResourceView(2, staging.GetGPUVirtualAddress());
+        list.SetComputeRootUnorderedAccessView(3, scratch.GetGPUVirtualAddress());
+        list.ResourceBarrier(&[transition(scratch, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+        for (k, l, base, (raw_at, tab_at)) in &planned {
+            let Some(t) = items[*k].3 else { continue };
+            std::ptr::copy_nonoverlapping(t.raw.as_ptr(), mapped.add(*raw_at as usize), t.raw.len());
+            std::ptr::copy_nonoverlapping(t.tables.as_ptr() as *const u8, mapped.add(*tab_at as usize), 4 * t.tables.len());
+            super::detile_gpu::record(list, t, *raw_at as u32, (*tab_at / 4) as u32, &l.fps, &l.rows, *base);
+        }
+        list.ResourceBarrier(&[transition(scratch, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+    }
+    for (k, l, base, _) in &planned {
+        let (res, subs, states, tiled) = &items[*k];
+        match (tiled, &scratch) {
+            (Some(_), Some(scratch)) => record_copies(&up.list, res, l, states, states, scratch, *base),
+            _ => record_into(&up.list, res, subs, l, states, states, &staging, mapped, *base),
+        }
+    }
+    if let Some(scratch) = &scratch {
+        up.list.ResourceBarrier(&[transition(scratch, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
     }
     up.list.Close().map_err(err)?;
     queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&up.list).map_err(err)?)]);
@@ -325,7 +411,7 @@ pub unsafe fn record_upload_states(
     before: &[D3D12_RESOURCE_STATES],
     after: &[D3D12_RESOURCE_STATES],
 ) -> Result<ID3D12Resource, String> {
-    let l = layout(dev, res, subs, before, after)?;
+    let l = layout(dev, res, subs, before, after, true)?;
     let up = buffer(dev, l.total)?;
     let mut p = std::ptr::null_mut();
     up.Map(0, None, Some(&mut p)).map_err(err)?;
@@ -343,8 +429,12 @@ struct Layout {
 }
 
 /// The `Layout` of uploading `subs` into `res`, checked against the resource.
-unsafe fn layout(dev: &ID3D12Device, res: &ID3D12Resource, subs: &[Subresource], before: &[D3D12_RESOURCE_STATES], after: &[D3D12_RESOURCE_STATES]) -> Result<Layout, String> {
-    validate_subresources(subs)?;
+unsafe fn layout(dev: &ID3D12Device, res: &ID3D12Resource, subs: &[Subresource], before: &[D3D12_RESOURCE_STATES], after: &[D3D12_RESOURCE_STATES], with_data: bool) -> Result<Layout, String> {
+    if with_data {
+        validate_subresources(subs)?;
+    } else if subs.is_empty() || subs.iter().any(|s| s.depth == 0 || s.rows == 0 || s.row_bytes == 0) {
+        return Err("texture upload without subresources, or one of zero size".into());
+    }
     let rd = res.GetDesc();
     let n = subs.len();
     validate_subresource_count(&rd, n)?;
@@ -374,7 +464,6 @@ unsafe fn layout(dev: &ID3D12Device, res: &ID3D12Resource, subs: &[Subresource],
 /// `res` on `list` (barriers from `before` and back to `after`).
 #[allow(clippy::too_many_arguments)]
 unsafe fn record_into(list: &ID3D12GraphicsCommandList, res: &ID3D12Resource, subs: &[Subresource], l: &Layout, before: &[D3D12_RESOURCE_STATES], after: &[D3D12_RESOURCE_STATES], up: &ID3D12Resource, mapped: *mut u8, base: u64) {
-    let n = subs.len();
     for ((s, fp), &nrows) in subs.iter().zip(&l.fps).zip(&l.rows) {
         let pitch = fp.Footprint.RowPitch as usize;
         let row = s.row_bytes.min(pitch);
@@ -387,6 +476,13 @@ unsafe fn record_into(list: &ID3D12GraphicsCommandList, res: &ID3D12Resource, su
             }
         }
     }
+    record_copies(list, res, l, before, after, up, base);
+}
+
+/// Record the copies of `l`'s subresources from the buffer `src` (from `base`) into `res`,
+/// with the barriers from `before` and back to `after`.
+unsafe fn record_copies(list: &ID3D12GraphicsCommandList, res: &ID3D12Resource, l: &Layout, before: &[D3D12_RESOURCE_STATES], after: &[D3D12_RESOURCE_STATES], up: &ID3D12Resource, base: u64) {
+    let n = l.fps.len();
     let to_copy = transitions(res, before, &[D3D12_RESOURCE_STATE_COPY_DEST], n);
     if !to_copy.is_empty() {
         list.ResourceBarrier(&to_copy);
@@ -735,6 +831,75 @@ mod tests {
                     assert!(g == w, "format {} {:?} mode {} subresource {k} ({} × {} rows × {} B) differs", t.format, t.ty, t.swizzle_mode, w.depth, w.rows, w.row_bytes);
                 }
             }
+        }
+    }
+
+    /// GPU detiling (`detile_gpu`) writes the same texels as the CPU (`Chain::detile_level` /
+    /// `detile_volume`): every 2D mode and element size (mips, 2 array slices, odd sizes, the
+    /// tiled bytes cut short) and a 3D texture, uploaded in one batch and read back.
+    #[test]
+    fn gpu_detile_matches_the_cpu() {
+        let Some((dev, queue)) = device() else {
+            println!("no D3D12 device – skipping");
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        };
+        unsafe {
+            if crate::gpu::detile_gpu::pipe(&dev).is_none() {
+                println!("no GPU detile pipeline (DXC?) – skipping");
+                return;
+            }
+            let format = |e: u32| [DXGI_FORMAT_R8_UINT, DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32G32_UINT, DXGI_FORMAT_R32G32B32A32_UINT][e as usize];
+            let make = |dim, w: usize, h: usize, d: usize, mips: usize, f| -> ID3D12Resource {
+                let rd = D3D12_RESOURCE_DESC { Dimension: dim, Width: w as u64, Height: h as u32, DepthOrArraySize: d as u16, MipLevels: mips as u16, Format: f, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() };
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &rd, SHADER_READ, None, &mut r).unwrap();
+                r.unwrap()
+            };
+            let bytes = |n: usize, seed: u32| -> Vec<u8> { (0..n as u32).map(|i| (i.wrapping_add(seed).wrapping_mul(2654435761) >> 13) as u8).collect() };
+            // (name, resource, CPU subresources, GPU plan)
+            let mut cases = Vec::new();
+            let (w, h, mips) = (150usize, 37usize, 6usize);
+            for mode in 0..32 {
+                for e in 0..5u32 {
+                    let Some(layout) = tiling::Layout::new(mode, e, CONSOLE_PIPES) else { continue };
+                    let c = Chain::new(layout, w as u32, h as u32, 1, mips as u32);
+                    let mut raw = bytes(2 * c.slice_bytes, mode * 8 + e);
+                    if mode % 3 == 1 {
+                        raw.truncate(raw.len() * 3 / 4);
+                    }
+                    let mut want = Vec::new();
+                    for sl in 0..2 {
+                        let at = (sl * c.slice_bytes).min(raw.len());
+                        let slice = &raw[at..(at + c.slice_bytes).min(raw.len())];
+                        for (i, l) in c.levels.iter().enumerate() {
+                            want.push(Subresource { depth: 1, rows: l.height, row_bytes: l.width << e, data: c.detile_level(slice, i, sl) });
+                        }
+                    }
+                    let Some(plan) = crate::gpu::detile_gpu::plan(&c, 1 << e, 2, false, raw) else { panic!("mode {mode} elem {e}: no plan") };
+                    cases.push((format!("2D mode {mode} elem {e}"), make(D3D12_RESOURCE_DIMENSION_TEXTURE2D, w, h, 2, mips, format(e)), want, plan));
+                }
+            }
+            for mode in [25u32, 26, 9] {
+                let Some(layout) = tiling::Layout::new_3d(mode, 2, CONSOLE_PIPES) else { continue };
+                let c = Chain::new_3d(layout, 40, 24, 12, 1, 3);
+                let raw = bytes(c.slice_bytes * c.layers(), mode);
+                let want = c.levels.iter().enumerate().map(|(i, l)| Subresource { depth: l.depth, rows: l.height, row_bytes: l.width * 4, data: c.detile_volume(&raw, i) }).collect();
+                let plan = crate::gpu::detile_gpu::plan(&c, 4, 1, true, raw).expect("3D plan");
+                cases.push((format!("3D mode {mode}"), make(D3D12_RESOURCE_DIMENSION_TEXTURE3D, 40, 24, 12, 3, DXGI_FORMAT_R32_UINT), want, plan));
+            }
+            let dims: Vec<Vec<Subresource>> = cases.iter().map(|(_, _, want, _)| want.iter().map(|s| Subresource { depth: s.depth, rows: s.rows, row_bytes: s.row_bytes, data: Vec::new() }).collect()).collect();
+            let states = [SHADER_READ];
+            let items: Vec<BatchItem> = cases.iter().zip(&dims).map(|((_, r, _, plan), d)| (r, d.as_slice(), &states[..], Some(plan))).collect();
+            let failed = upload_batch_with(&dev, &queue, &items).unwrap();
+            assert!(failed.is_empty(), "uploads failed: {failed:?}");
+            for (name, r, want, _) in &cases {
+                let got = read_back(&dev, &queue, r, want);
+                for (k, (g, w)) in got.iter().zip(want).enumerate() {
+                    assert!(g == w, "{name}: subresource {k} differs from the CPU detile");
+                }
+            }
+            println!("GPU detile matched the CPU in {} textures", cases.len());
         }
     }
 

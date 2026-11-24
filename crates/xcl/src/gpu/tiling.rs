@@ -152,6 +152,28 @@ impl Layout {
         }
     }
 
+    /// Elements in a row that lie next to each other in memory, in aligned groups: x bits below
+    /// `log2(run)` give the low address bits directly (`x << elem_log2`) and no other coordinate
+    /// or swizzle touches those bits, so `run` elements from an aligned x are one copy.
+    pub fn run(&self) -> usize {
+        let mut r = 1;
+        while r * 2 <= self.block_w && self.ox[r] == (r << self.elem_log2) as u32 {
+            let mask = ((2 * r) << self.elem_log2) as u32 - 1;
+            let aligned = self.ox.iter().step_by(2 * r).chain(&self.oy).chain(&self.oz).chain(&self.hx).chain(&self.hy).chain(&self.hz);
+            if self.base_xor as u32 & mask != 0 || aligned.clone().any(|&v| v & mask != 0) {
+                break;
+            }
+            r *= 2;
+        }
+        r
+    }
+
+    /// The offset tables (ox, oy, oz, hx, hy, hz) for detiling elsewhere (the GPU,
+    /// `gpu::detile_gpu`): `offset_z` XORs them, the h tables indexed modulo their length.
+    pub fn tables(&self) -> [&[u32]; 6] {
+        [&self.ox, &self.oy, &self.oz, &self.hx, &self.hy, &self.hz]
+    }
+
     /// surface `w` × `h` elements: (blocks per row, blocks per column)
     pub fn blocks(&self, w: usize, h: usize) -> (usize, usize) {
         (w.div_ceil(self.block_w), h.div_ceil(self.block_h))
@@ -428,14 +450,24 @@ impl Chain {
             })
             .collect();
         let z = t.oz[slice % t.block_d] ^ hi(&t.hz, slice, t.block_d);
+        let run = if l.origin.0 % t.run() == 0 { t.run() } else { 1 };
         for (y, row) in out.chunks_exact_mut(l.width * e).enumerate() {
             let y = y + l.origin.1;
             let row_blocks = (y / t.block_h) * pitch_blocks;
             let yz = t.oy[y % t.block_h] ^ hi(&t.hy, y, t.block_h) ^ z;
-            for (&(block_x, x), dst) in columns.iter().zip(row.chunks_exact_mut(e)) {
-                let o = l.offset + (row_blocks + block_x) * t.block_bytes + ((x ^ yz) as usize ^ t.base_xor);
-                if let Some(s) = src.get(o..o + e) {
+            // `run` neighbouring elements from an aligned x are contiguous (16 B in the swizzled
+            // modes): one copy each, element by element only where a run leaves `src`
+            for (cols, dst) in columns.chunks(run).zip(row.chunks_mut(run * e)) {
+                let o = l.offset + (row_blocks + cols[0].0) * t.block_bytes + ((cols[0].1 ^ yz) as usize ^ t.base_xor);
+                if let Some(s) = src.get(o..o + dst.len()) {
                     dst.copy_from_slice(s);
+                    continue;
+                }
+                for (&(block_x, x), dst) in cols.iter().zip(dst.chunks_exact_mut(e)) {
+                    let o = l.offset + (row_blocks + block_x) * t.block_bytes + ((x ^ yz) as usize ^ t.base_xor);
+                    if let Some(s) = src.get(o..o + e) {
+                        dst.copy_from_slice(s);
+                    }
                 }
             }
         }
@@ -468,6 +500,36 @@ pub fn image_chain(t: &super::desc::Image, cfg: PipeConfig) -> Option<Chain> {
 
 #[cfg(test)]
 mod tests {
+    /// `detile_level` copies contiguous runs: the same bytes as element by element, for every
+    /// mode, element size, pipe config and mip, also when `src` ends inside the level
+    #[test]
+    fn detile_level_runs_match_elements() {
+        for cfg in [crate::gpu::texture::CONSOLE_PIPES, crate::gpu::texture::SERIES_S_PIPES, PipeConfig { pipes_log2: 0, pkrs_log2: 0 }] {
+            for mode in 0..32 {
+                for e in 0..5 {
+                    let Some(layout) = Layout::new(mode, e, cfg) else { continue };
+                    let c = Chain::new(layout, 300, 77, 2, 7);
+                    let bytes: Vec<u8> = (0..c.slice_bytes as u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+                    for i in 0..c.levels.len() {
+                        let l = c.levels[i];
+                        for src in [&bytes[..], &bytes[..bytes.len() * 2 / 3]] {
+                            let mut want = vec![0u8; l.width * l.height << e];
+                            for y in 0..l.height {
+                                for x in 0..l.width {
+                                    let o = c.element_at(&l, x, y, 1);
+                                    if let Some(s) = src.get(o..o + (1 << e)) {
+                                        want[(y * l.width + x) << e..][..1 << e].copy_from_slice(s);
+                                    }
+                                }
+                            }
+                            assert!(c.detile_level(src, i, 1) == want, "mode {mode} elem {e} level {i} src {}", src.len());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     use super::*;
 
     const MODES: [u32; 14] = [1, 2, 5, 6, 9, 10, 17, 18, 21, 22, 24, 25, 26, 27];
