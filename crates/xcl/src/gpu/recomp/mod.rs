@@ -52,6 +52,7 @@
 //! `ByteAddressBuffer` (`mem`); initial SGPRs (user data) come from `io`. Textures come next.
 
 pub mod dxc;
+pub mod dxil;
 pub mod lane_masks;
 pub(crate) mod emit;
 pub mod mesh_dispatch;
