@@ -127,6 +127,12 @@ impl Ir for DxilIr {
         let w = self.s.wave_ballot(c);
         [w[0], w[1]]
     }
+    fn read_lane(&mut self, v: Value, lane: Value) -> Value {
+        self.s.wave_read_lane_at(v, lane)
+    }
+    fn count_bits(&mut self, v: Value) -> Value {
+        self.s.bit_count(crate::gpu::dxil::ops::BitCount::Countbits, v)
+    }
     fn io_load(&mut self, dword: Value) -> Value {
         let a = self.bytes(dword);
         let io = self.io;
