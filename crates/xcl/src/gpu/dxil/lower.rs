@@ -211,6 +211,8 @@ pub struct Lw {
     /// set when an exchange was needed where it is not supported
     pub exchange_error: Option<String>,
     pub pc: u64,
+    /// the highest VGPR the program names (`v_movrel*` / `v_swaprel` index up to it)
+    pub max_vgpr: u64,
     /// Lowering under an externally chosen guard ([`Lw::inst_guarded`]): when set,
     /// `act()` (this lane is active: VGPR write selects, guarded memory) returns it
     /// instead of this lane's bit of the SSA EXEC.

@@ -37,7 +37,7 @@ pub struct KernelOptions {
 /// Version of the direct translator's output, part of the on-disk translation cache's
 /// identity (`recomp::pso`): bump it on any change that alters the emitted containers
 /// (the `gpu/dxil` sources are not in build.rs's translator source hash).
-pub const TRANSLATOR_VERSION: u32 = 7;
+pub const TRANSLATOR_VERSION: u32 = 8;
 
 /// `XCL_DIRECT_DXIL=1`: console compute shaders (and the kernel tests) go through this
 /// translator, with the HLSL path as the fallback for what it cannot translate yet.
@@ -445,6 +445,16 @@ impl Lw {
             mask_override: None,
             exchange_error: None,
             pc: 0,
+            // as the HLSL path's `max_vgpr`: every instruction's, not only the ones lowered so far
+            max_vgpr: insts
+                .iter()
+                .flat_map(|d| {
+                    let (r, w) = crate::gpu::rdna2::vgpr_uses(d);
+                    r.into_iter().chain(w)
+                })
+                .filter(|&r| r < 256)
+                .max()
+                .unwrap_or(0),
         };
         {
             let Lw { s, ssa, init, .. } = &mut lw;

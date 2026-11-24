@@ -262,7 +262,7 @@ impl Lw {
 
     /// The highest VGPR the program names (relative moves index up to it).
     fn top_vgpr(&self) -> u64 {
-        self.init.touched.iter().filter(|&&v| (VAR_VGPR..VAR_VGPR + 256).contains(&v)).map(|&v| (v - VAR_VGPR) as u64).max().unwrap_or(0)
+        self.max_vgpr
     }
 
     pub fn movrel(&mut self, d: &Decoded, name: &str) -> LResult<()> {

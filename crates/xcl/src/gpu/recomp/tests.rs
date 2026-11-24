@@ -2827,6 +2827,42 @@ fn gpu_packed_math_dots_movrel() {
     }
 }
 
+/// `v_movreld_b32` in a compute program writes a VGPR the program names only after it
+/// (v1 + m0 = v3): the relative write reaches every VGPR the program has, on the HLSL path
+/// and in the direct DXIL translator.
+#[test]
+fn gpu_compute_movreld_reaches_a_vgpr_named_after_it() {
+    use crate::gpu::dxil::kernel::{translate_compute, KernelOptions};
+    let waves = gpu_waves();
+    if waves.is_empty() {
+        return;
+    }
+    // m0 = 2; v[1 + m0] = v0 (the thread id); out[tid] = v3
+    let p = prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 130)], None),
+        ("V_MOVRELD_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 8), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 9), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 8), ("DATA", 3), ("SADDR", 125), ("OFFSET", 0)], None),
+    ]);
+    for wave64 in waves {
+        let lanes = if wave64 { 64 } else { 32 };
+        let cs = super::CsInterface { threads: [lanes, 1, 1], user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 1 };
+        let opt = Options { mode: Mode::Compute(cs.clone()), wave64, ..Default::default() };
+        let t = translate(&p, &opt).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let hlsl = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+        let o = KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 };
+        let direct = translate_compute(&p, o, &cs).unwrap_or_else(|e| panic!("direct DXIL: {e}")).dxil;
+        for (path, dxil) in [("HLSL", hlsl), ("direct DXIL", direct)] {
+            let out = runner::dispatch(&dxil, [1, 1, 1], &[0, 0], &vec![0u32; 64]).unwrap();
+            for tid in 0..lanes {
+                assert_eq!(out[tid as usize], tid, "{path}, wave{lanes}, thread {tid}: v3");
+            }
+        }
+    }
+}
+
 #[test]
 fn dxc_mesh_shader_probe() {
     use super::dxc;
