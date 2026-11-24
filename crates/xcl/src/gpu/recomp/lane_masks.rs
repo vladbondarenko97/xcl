@@ -214,11 +214,24 @@ struct State {
     scc: Option<(B, bool)>,
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum Edge {
+/// How a block's successor is reached: unconditionally, or by its branch taken / not taken.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Edge {
     Always,
     Taken,
     NotTaken,
+}
+
+/// A basic block of the program, as the lowering walks it.
+#[derive(Clone, Debug)]
+pub struct Block {
+    /// its instructions: indices into the decoded program
+    pub insts: std::ops::Range<usize>,
+    pub succ: Vec<(usize, Edge)>,
+    /// predecessors that the entry reaches, back edges included
+    pub preds: Vec<usize>,
+    /// it ends in a branch on a lane mask: each lane takes it on its own bit
+    pub lane_branch: bool,
 }
 
 /// What the analysis found in a program.
@@ -231,6 +244,10 @@ pub struct Summary {
     /// conditional branches on a lane mask (each lane decides) and on uniform values
     pub lane_branches: usize,
     pub uniform_branches: usize,
+    /// the CFG (block 0 is the entry) and the order to lower it in (reverse postorder of the
+    /// blocks the entry reaches: every block after its forward predecessors)
+    pub blocks: Vec<Block>,
+    pub order: Vec<usize>,
 }
 
 /// Executed with the lane's EXEC bit (VOPC and the lane reads / writes are mask producers).
@@ -735,6 +752,7 @@ impl<'a> Lanes<'a> {
         }
         let mut sum = Summary::default();
         let mut implied: HashMap<(B, B), bool> = HashMap::new();
+        let mut lane_branch = vec![false; self.blocks.len()];
         for &b in &self.order.clone() {
             let mut st = ins[b].clone().unwrap();
             let (first, end) = self.blocks[b];
@@ -761,8 +779,18 @@ impl<'a> Lanes<'a> {
                 } else {
                     sum.uniform_branches += 1;
                 }
+                lane_branch[b] = lane;
             }
         }
+        sum.blocks = (0..self.blocks.len())
+            .map(|b| Block {
+                insts: self.blocks[b].0..self.blocks[b].1,
+                succ: self.succ[b].clone(),
+                preds: self.preds[b].iter().map(|p| p.0).collect(),
+                lane_branch: lane_branch[b],
+            })
+            .collect();
+        sum.order = self.order.clone();
         Ok(sum)
     }
 }
@@ -843,6 +871,13 @@ mod tests {
         ])
         .unwrap();
         assert_eq!((s.vector, s.guarded.len(), s.lane_branches, s.uniform_branches), (2, 0, 1, 0));
+        // the CFG the lowering walks: entry (to the skip), the v_mov, the join
+        let b = &s.blocks;
+        assert_eq!(b.iter().map(|b| b.insts.clone()).collect::<Vec<_>>(), vec![0..3, 3..4, 4..7]);
+        assert_eq!(b[0].succ, vec![(2, Edge::Taken), (1, Edge::NotTaken)]);
+        assert_eq!((b[1].succ.clone(), b[2].preds.clone()), (vec![(2, Edge::Always)], vec![0, 1]));
+        assert_eq!(b.iter().map(|b| b.lane_branch).collect::<Vec<_>>(), vec![true, false, false]);
+        assert_eq!(s.order, vec![0, 1, 2]);
     }
 
     #[test]

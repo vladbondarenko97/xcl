@@ -54,6 +54,7 @@
 pub mod dxc;
 pub mod dxil;
 pub mod lane_masks;
+pub mod lower;
 pub(crate) mod emit;
 pub mod mesh_dispatch;
 pub mod mesh_wave;
@@ -61,6 +62,7 @@ pub mod x64_masks;
 pub mod pso;
 pub use emit::mesh_passthrough;
 pub mod runner;
+pub mod ssa;
 #[cfg(test)]
 mod tests;
 pub mod upper_lanes;
