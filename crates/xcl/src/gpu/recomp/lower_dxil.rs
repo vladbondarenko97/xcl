@@ -7,10 +7,11 @@
 //! construction finds trivial keeps its (identical) incoming values instead of being removed:
 //! the builder has no use replacement, and the driver folds such phis.
 
-use super::lower::{self, Bin, Cmp, Ir};
+use super::lower::{self, Bin, Cmp, FBin, FUn, Ir};
 use super::ssa::{Sink, Var};
 use crate::gpu::dxil::container::Stage;
 use crate::gpu::dxil::module::{BinOp, Block, CastOp, Pred, Value};
+use crate::gpu::dxil::ops::{Binary, FUnary, Tertiary};
 use crate::gpu::dxil::shader::{RawUav, Shader};
 use crate::gpu::rdna2::Decoded;
 
@@ -37,6 +38,20 @@ impl DxilIr {
             Var::M(_) | Var::Scc => self.s.m.i1(),
             Var::S(_) | Var::V(_) => self.s.m.i32(),
         }
+    }
+
+    /// The float view of a dword (a constant as a float constant)
+    fn f(&mut self, v: Value) -> Value {
+        if let Some(c) = self.s.m.const_u64(v) {
+            return self.s.m.f32c(c as u32);
+        }
+        let t = self.s.m.f32();
+        self.s.m.bitcast(v, t)
+    }
+
+    fn bits(&mut self, v: Value) -> Value {
+        let t = self.s.m.i32();
+        self.s.m.bitcast(v, t)
     }
 
     fn bytes(&mut self, dword: Value) -> Value {
@@ -141,6 +156,36 @@ impl Ir for DxilIr {
     fn count_bits(&mut self, v: Value) -> Value {
         self.s.bit_count(crate::gpu::dxil::ops::BitCount::Countbits, v)
     }
+    // f32 ops as #1426's `Lw` writes them (`fadd` / `fsub` / `fmul` without fast-math flags,
+    // `-x` as `fsub -0.0, x`, `FMin` / `FMax` / `FAbs` / `Saturate` / `FMad`)
+    fn fbin(&mut self, op: FBin, a: Value, b: Value) -> Value {
+        let (a, b) = (self.f(a), self.f(b));
+        let r = match op {
+            FBin::Add => self.s.m.fbin(BinOp::Add, a, b, 0),
+            FBin::Sub => self.s.m.fbin(BinOp::Sub, a, b, 0),
+            FBin::Mul => self.s.m.fbin(BinOp::Mul, a, b, 0),
+            FBin::Min => self.s.binary(Binary::FMin, a, b),
+            FBin::Max => self.s.binary(Binary::FMax, a, b),
+        };
+        self.bits(r)
+    }
+    fn fun(&mut self, op: FUn, a: Value) -> Value {
+        let a = self.f(a);
+        let r = match op {
+            FUn::Abs => self.s.funary(FUnary::FAbs, a),
+            FUn::Neg => {
+                let z = self.s.m.f32c(0x8000_0000);
+                self.s.m.fbin(BinOp::Sub, z, a, 0)
+            }
+            FUn::Sat => self.s.funary(FUnary::Saturate, a),
+        };
+        self.bits(r)
+    }
+    fn fmad(&mut self, a: Value, b: Value, c: Value) -> Value {
+        let (a, b, c) = (self.f(a), self.f(b), self.f(c));
+        let r = self.s.tertiary(Tertiary::FMad, a, b, c);
+        self.bits(r)
+    }
     fn io_load(&mut self, dword: Value) -> Value {
         let a = self.bytes(dword);
         let io = self.io;
@@ -218,7 +263,7 @@ mod tests {
         if !gpu() {
             return;
         }
-        for (name, lines) in [("straight", STRAIGHT), ("skipped if", SKIPPED_IF), ("leaving loop", LEAVING_LOOP), ("uniform loop", UNIFORM_LOOP), ("memory", MEMORY)] {
+        for (name, lines) in [("straight", STRAIGHT), ("skipped if", SKIPPED_IF), ("leaving loop", LEAVING_LOOP), ("uniform loop", UNIFORM_LOOP), ("memory", MEMORY), ("f32 arithmetic", F32_ARITHMETIC)] {
             let insts = decode(lines);
             let (dxil, stale) = super::kernel(&insts, false).unwrap_or_else(|e| panic!("{name}: {e}"));
             let (s, v) = state(32);

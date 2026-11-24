@@ -52,6 +52,25 @@ pub enum Cmp {
     Sge,
 }
 
+/// f32 operations, on dword bits in and out (`Ir::fbin`). `Min` / `Max` are DXIL's `FMin` /
+/// `FMax` (HLSL `min` / `max`): a NaN operand gives the other one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FBin {
+    Add,
+    Sub,
+    Mul,
+    Min,
+    Max,
+}
+
+/// `Abs` and `Neg` as HLSL's `abs` / `-x`; `Sat` is `saturate` (NaN gives 0)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FUn {
+    Abs,
+    Neg,
+    Sat,
+}
+
 /// What the lowering needs from the DXIL module builder. Blocks are numbered in the order
 /// `new_block` creates them, the first being the entry; `And` / `Or` / `Xor` take `i1` or `i32`.
 pub trait Ir: Sink {
@@ -81,6 +100,11 @@ pub trait Ir: Sink {
     fn read_lane_half(&mut self, v: Self::V, lane: Self::V) -> Self::V;
     /// the number of bits set in `v` (`countbits`)
     fn count_bits(&mut self, v: Self::V) -> Self::V;
+    /// f32 arithmetic on the dwords' bits, each step rounded on its own (no contraction)
+    fn fbin(&mut self, op: FBin, a: Self::V, b: Self::V) -> Self::V;
+    fn fun(&mut self, op: FUn, a: Self::V) -> Self::V;
+    /// HLSL's `mad` (DXIL `FMad`): fused or not, as the driver chooses
+    fn fmad(&mut self, a: Self::V, b: Self::V, c: Self::V) -> Self::V;
     fn io_load(&mut self, dword: Self::V) -> Self::V;
     fn res_store(&mut self, dword: Self::V, value: Self::V);
     /// the dword of the flat memory (`mem`, u2) at a byte address (a multiple of 4); out of
@@ -93,6 +117,9 @@ pub trait Ir: Sink {
 }
 
 const EXEC: u8 = 126;
+
+/// The f32 arithmetic `f32_arith` lowers.
+const F32_ARITH: &[&str] = &["V_ADD_F32", "V_SUB_F32", "V_SUBREV_F32", "V_MUL_F32", "V_MIN_F32", "V_MAX_F32", "V_FMA_F32", "V_MAD_F32", "V_MAC_F32", "V_FMAC_F32"];
 const VCC: u8 = 106;
 
 /// The program's stage: where its registers come from and go.
@@ -469,8 +496,8 @@ impl<'a, I: Ir> Lower<'a, I> {
                 self.write_scc(b, v);
             }
             "S_NOP" | "S_WAITCNT" | "S_WAITCNT_VSCNT" | "S_WAITCNT_VMCNT" | "S_WAITCNT_LGKMCNT" | "S_WAITCNT_EXPCNT" | "S_INST_PREFETCH" | "S_CLAUSE" => {}
-            // MODE (float rounding / denormals): only float instructions read it, and the
-            // lowering refuses every float instruction so far – revisit when floats come in
+            // MODE (float rounding / denormals): the f32 ops lowered so far ignore it, as the
+            // HLSL path does for f32 (it follows MODE only for f16 / f64 rounding)
             "S_SETREG_IMM32_B32" | "S_SETREG_B32" if self.sets_mode_only(d) => {}
             "S_SETREG_IMM32_B32" | "S_SETREG_B32" => {
                 let s = fv("SIMM16").unwrap_or(0);
@@ -514,7 +541,9 @@ impl<'a, I: Ir> Lower<'a, I> {
         }
         let fv = |f: &str| rdna2::field_value(d.enc, &d.words, f);
         let vop3 = d.enc.name.starts_with("ENC_VOP3") || d.enc.name.starts_with("VOP3");
-        if vop3 && ["ABS", "NEG", "CLAMP", "OMOD", "OP_SEL"].iter().any(|f| fv(f).unwrap_or(0) != 0) {
+        // the float modifiers are the f32 ops' (`f32_arith`); OP_SEL is no one's yet
+        let mods: &[&str] = if F32_ARITH.contains(&name) { &["OP_SEL"] } else { &["ABS", "NEG", "CLAMP", "OMOD", "OP_SEL"] };
+        if vop3 && mods.iter().any(|f| fv(f).unwrap_or(0) != 0) {
             return Err(format!("{name}: VOP3 modifiers"));
         }
         // sources: VOP1 / VOP2 / VOPC put src1 in VSRC1 (a VGPR); VOP3 in SRC1
@@ -550,6 +579,10 @@ impl<'a, I: Ir> Lower<'a, I> {
             let dst = if x { EXEC } else if vop3 { vdst as u8 } else { VCC };
             self.write_bit(b, dst, bit);
             return Ok(());
+        }
+        if F32_ARITH.contains(&name) {
+            let v = self.f32_arith(b, d, vop3, s0, s1, vdst)?;
+            return self.write_v(b, d, vdst as u16, v);
         }
         let v = match name {
             "V_MOV_B32" => self.src(b, d, s0)?,
@@ -613,6 +646,50 @@ impl<'a, I: Ir> Lower<'a, I> {
             }
         };
         self.write_v(b, d, vdst as u16, v)
+    }
+
+    /// f32 VOP2 / VOP3 arithmetic as the HLSL path writes it (`emit.rs` `valu`): each source
+    /// takes abs, then neg, the result omod, then clamp. `v_fma` / `v_fmac` are HLSL's `mad`;
+    /// `v_mad` / `v_mac` round the product before the add (`mad_nf`).
+    fn f32_arith(&mut self, b: usize, d: &Decoded, vop3: bool, s0: u64, s1: u64, vdst: u64) -> R<I::V> {
+        let name = d.inst.name;
+        let fv = |f: &str| if vop3 { rdna2::field_value(d.enc, &d.words, f).unwrap_or(0) } else { 0 };
+        let n = if matches!(name, "V_FMA_F32" | "V_MAD_F32") { 3 } else { 2 };
+        let mut x = Vec::new();
+        for (i, code) in [s0, s1, fv("SRC2")].into_iter().take(n).enumerate() {
+            let mut v = self.src(b, d, code)?;
+            if fv("ABS") >> i & 1 == 1 {
+                v = self.ir.fun(FUn::Abs, v);
+            }
+            if fv("NEG") >> i & 1 == 1 {
+                v = self.ir.fun(FUn::Neg, v);
+            }
+            x.push(v);
+        }
+        if matches!(name, "V_MAC_F32" | "V_FMAC_F32") {
+            x.push(self.read(b, Var::V(vdst as u16)));
+        }
+        let r = match name {
+            "V_ADD_F32" => self.ir.fbin(FBin::Add, x[0], x[1]),
+            "V_SUB_F32" => self.ir.fbin(FBin::Sub, x[0], x[1]),
+            "V_SUBREV_F32" => self.ir.fbin(FBin::Sub, x[1], x[0]),
+            "V_MUL_F32" => self.ir.fbin(FBin::Mul, x[0], x[1]),
+            "V_MIN_F32" => self.ir.fbin(FBin::Min, x[0], x[1]),
+            "V_MAX_F32" => self.ir.fbin(FBin::Max, x[0], x[1]),
+            "V_FMA_F32" | "V_FMAC_F32" => self.ir.fmad(x[0], x[1], x[2]),
+            _ => {
+                let p = self.ir.fbin(FBin::Mul, x[0], x[1]);
+                self.ir.fbin(FBin::Add, p, x[2])
+            }
+        };
+        let r = match fv("OMOD") {
+            0 => r,
+            m => {
+                let k = self.ir.int([2.0f32, 4.0, 0.5][m as usize - 1].to_bits());
+                self.ir.fbin(FBin::Mul, r, k)
+            }
+        };
+        Ok(if fv("CLAMP") == 1 { self.ir.fun(FUn::Sat, r) } else { r })
     }
 
     /// `s_setreg*` writing `HW_REG_MODE` (id 1 of its `SIMM16`) and nothing else.
@@ -1248,6 +1325,9 @@ pub(crate) mod tests {
         BallotHalf(u32, usize),
         ReadLaneHalf(u32, u32),
         CountBits(u32),
+        FBin(FBin, u32, u32),
+        FUn(FUn, u32),
+        FMad(u32, u32, u32),
         IoLoad(u32),
         ResStore(u32, u32),
         MemLoad(u32),
@@ -1375,6 +1455,15 @@ pub(crate) mod tests {
         fn count_bits(&mut self, v: u32) -> u32 {
             self.push(Ins::CountBits(v))
         }
+        fn fbin(&mut self, op: FBin, a: u32, b: u32) -> u32 {
+            self.push(Ins::FBin(op, a, b))
+        }
+        fn fun(&mut self, op: FUn, a: u32) -> u32 {
+            self.push(Ins::FUn(op, a))
+        }
+        fn fmad(&mut self, a: u32, b: u32, c: u32) -> u32 {
+            self.push(Ins::FMad(a, b, c))
+        }
         fn io_load(&mut self, dword: u32) -> u32 {
             self.push(Ins::IoLoad(dword))
         }
@@ -1493,6 +1582,27 @@ pub(crate) mod tests {
                                 Ins::ThreadId(k) => Some(if *k == 0 { base + lane as u32 } else { 0 }),
                                 Ins::Ballot(..) | Ins::BallotHalf(..) | Ins::ReadLane(..) | Ins::ReadLaneHalf(..) => break,
                                 Ins::CountBits(v) => Some(g(v).count_ones()),
+                                Ins::FBin(op, a, b) => {
+                                    let (a, b) = (f32::from_bits(g(a)), f32::from_bits(g(b)));
+                                    // f32::min / max give the operand that is not NaN, as FMin / FMax
+                                    Some(match op {
+                                        FBin::Add => a + b,
+                                        FBin::Sub => a - b,
+                                        FBin::Mul => a * b,
+                                        FBin::Min => a.min(b),
+                                        FBin::Max => a.max(b),
+                                    }.to_bits())
+                                }
+                                Ins::FUn(op, a) => {
+                                    let a = f32::from_bits(g(a));
+                                    Some(match op {
+                                        FUn::Abs => a.abs(),
+                                        FUn::Neg => -a,
+                                        FUn::Sat => if a.is_nan() { 0.0 } else { a.clamp(0.0, 1.0) },
+                                    }.to_bits())
+                                }
+                                // the product rounded first: tests keep to products that are exact
+                                Ins::FMad(a, b, c) => Some((f32::from_bits(g(a)) * f32::from_bits(g(b)) + f32::from_bits(g(c))).to_bits()),
                                 Ins::IoLoad(a) => Some(io[g(a) as usize]),
                                 Ins::MemLoad(a) => Some(mem.get((g(a) / 4) as usize).copied().unwrap_or(0)),
                                 Ins::MemStore(a, v) => {
@@ -1641,6 +1751,46 @@ pub(crate) mod tests {
         ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 0), ("VSRC1", 1)]),
         ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 2), ("VSRC1", 1)]),
         ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 2), ("DATA", 1), ("SADDR", 125), ("OFFSET", 0)]),
+        ENDPGM,
+    ];
+
+    /// f32 VOP2 / VOP3 arithmetic on v1 = 2^lane and v2 = 2^lane · (1 + lane / 64), with the
+    /// VOP3 modifiers, and v19 = NaN (0x7FFFFFFF) into min / max / clamp. Every product is exact,
+    /// so `FMad` gives the same fused or not.
+    pub(crate) const F32_ARITHMETIC: &[I] = &[
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 192), ("VSRC1", 0)]),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 191), ("VSRC1", 1)]),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 151), ("VSRC1", 1)]),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 145), ("VSRC1", 0)]),
+        ("V_OR_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", V + 1), ("VSRC1", 2)]),
+        ("V_LSHRREV_B32", "ENC_VOP3", &[("VDST", 19), ("SRC0", 129), ("SRC1", 193)]),
+        // 0.5 + x, x - p, x - (-4), x · x, min / max(2, x)
+        ("V_ADD_F32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 240), ("VSRC1", 2)]),
+        ("V_SUB_F32", "ENC_VOP2", &[("VDST", 4), ("SRC0", V + 2), ("VSRC1", 1)]),
+        ("V_SUBREV_F32", "ENC_VOP2", &[("VDST", 5), ("SRC0", 247), ("VSRC1", 2)]),
+        ("V_MUL_F32", "ENC_VOP2", &[("VDST", 6), ("SRC0", V + 2), ("VSRC1", 2)]),
+        ("V_MIN_F32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 244), ("VSRC1", 2)]),
+        ("V_MAX_F32", "ENC_VOP2", &[("VDST", 8), ("SRC0", 244), ("VSRC1", 2)]),
+        // fma(x, -2, p), mad(x, 0.5, v3); mac v11 = 4 · x + p, fmac v12 = -0.5 · x + v3
+        ("V_FMA_F32", "ENC_VOP3", &[("VDST", 9), ("SRC0", V + 2), ("SRC1", 245), ("SRC2", V + 1)]),
+        ("V_MAD_F32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 2), ("SRC1", 240), ("SRC2", V + 3)]),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 11), ("SRC0", V + 1)]),
+        ("V_MAC_F32", "ENC_VOP2", &[("VDST", 11), ("SRC0", 246), ("VSRC1", 2)]),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 12), ("SRC0", V + 3)]),
+        ("V_FMAC_F32", "ENC_VOP2", &[("VDST", 12), ("SRC0", 241), ("VSRC1", 2)]),
+        // -|x| · |-4| (abs before neg); omod 0.5, 2, 4 (with neg on src2); clamp at 1 and at 0
+        ("V_MUL_F32", "ENC_VOP3", &[("VDST", 13), ("SRC0", V + 2), ("SRC1", 247), ("ABS", 3), ("NEG", 1)]),
+        ("V_ADD_F32", "ENC_VOP3", &[("VDST", 14), ("SRC0", V + 2), ("SRC1", V + 1), ("OMOD", 3)]),
+        ("V_SUB_F32", "ENC_VOP3", &[("VDST", 15), ("SRC0", V + 1), ("SRC1", V + 2), ("OMOD", 1)]),
+        ("V_FMA_F32", "ENC_VOP3", &[("VDST", 16), ("SRC0", V + 1), ("SRC1", V + 1), ("SRC2", V + 2), ("NEG", 4), ("OMOD", 2)]),
+        ("V_MUL_F32", "ENC_VOP3", &[("VDST", 17), ("SRC0", V + 4), ("SRC1", 240), ("CLAMP", 1)]),
+        ("V_FMA_F32", "ENC_VOP3", &[("VDST", 18), ("SRC0", V + 2), ("SRC1", 243), ("SRC2", 244), ("CLAMP", 1)]),
+        // min(NaN, x), max(x, -NaN), clamp(NaN · 1); VOP3 fmac v23 = |-0.5| · x + p
+        ("V_MIN_F32", "ENC_VOP2", &[("VDST", 20), ("SRC0", V + 19), ("VSRC1", 2)]),
+        ("V_MAX_F32", "ENC_VOP3", &[("VDST", 21), ("SRC0", V + 2), ("SRC1", V + 19), ("NEG", 2)]),
+        ("V_MUL_F32", "ENC_VOP3", &[("VDST", 22), ("SRC0", V + 19), ("SRC1", 242), ("CLAMP", 1)]),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 23), ("SRC0", V + 1)]),
+        ("V_FMAC_F32", "ENC_VOP3", &[("VDST", 23), ("SRC0", 241), ("SRC1", V + 2), ("ABS", 1)]),
         ENDPGM,
     ];
 
@@ -2003,6 +2153,40 @@ pub(crate) mod tests {
         lines.insert(8, ("S_MOV_B32", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 1)]));
         let err = lower_kernel(&decode(&lines), false, Interp::default()).err().expect("refused");
         assert!(err.contains("some lanes were elsewhere"), "{err}");
+    }
+
+    #[test]
+    fn f32_arithmetic_with_vop3_modifiers() {
+        let sat = |x: f32| x.clamp(0.0, 1.0);
+        let (s, v) = state(32);
+        let (_, v) = run(F32_ARITHMETIC, false, &s, &v);
+        for (l, r) in v.iter().enumerate() {
+            let f = |i: usize| f32::from_bits(r[i]);
+            let (p, x) = (f(1), f(2));
+            assert_eq!((p, x), (2f32.powi(l as i32), 2f32.powi(l as i32) * (1.0 + l as f32 / 64.0)), "lane {l}");
+            let y = x + 0.5;
+            let want = [y, x - p, x + 4.0, x * x, x.min(2.0), x.max(2.0), x * -2.0 + p, x * 0.5 + y, 4.0 * x + p, -0.5 * x + y, -x * 4.0, (x + p) * 0.5, (p - x) * 2.0, (p * p - x) * 4.0, sat((x - p) * 0.5), sat(2.0 - x)];
+            for (i, w) in want.iter().enumerate() {
+                assert_eq!(f(3 + i).to_bits(), w.to_bits(), "lane {l} v{}: {} against {w}", 3 + i, f(3 + i));
+            }
+            assert_eq!((r[20], r[21], r[22]), (r[2], r[2], 0), "lane {l}: NaN into min, max, clamp");
+            assert_eq!(f(23), 0.5 * x + p, "lane {l}: VOP3 fmac");
+        }
+    }
+
+    #[test]
+    fn f32_arithmetic_agrees_with_the_hlsl_path_on_the_gpu() {
+        use super::super::{dxc, runner};
+        if runner::adapter().is_err() || dxc::location().is_err() {
+            runner::skip_test(if runner::adapter().is_err() { "no GPU" } else { "no DXC" });
+            return;
+        }
+        agrees_with_hlsl("f32 arithmetic, wave32", F32_ARITHMETIC, false, &[]);
+        if runner::wave64_supported() != Ok(true) {
+            runner::skip_test("no wave64");
+            return;
+        }
+        agrees_with_hlsl("f32 arithmetic, wave64", F32_ARITHMETIC, true, &[]);
     }
 
     #[test]
