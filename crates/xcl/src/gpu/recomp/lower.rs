@@ -2242,6 +2242,223 @@ pub(crate) mod tests {
         if s == 1 { -v } else { v }
     }
 
+    // integer programs, as the f32 ones: `lower_dxil`'s `integer_programs_on_the_gpu` checks the
+    // HLSL path's registers with the `check_int_*` below and compares the per-lane form with it
+
+    /// a = lane · 0x9E3779B9 (v1), b = lane − (a >> 13) (v2, negative but at lane 0) and
+    /// c = 0x7FFFFFF0 + lane (v3, past i32::MAX from lane 16)
+    const INT_INPUTS: [I; 5] = [
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 9), ("SRC0", 255), ("LITERAL", 0x9E37_79B9)]),
+        ("V_MUL_LO_U32", "ENC_VOP3", &[("VDST", 1), ("SRC0", V), ("SRC1", V + 9)]),
+        ("V_LSHRREV_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 141), ("VSRC1", 1)]),
+        ("V_SUB_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", V), ("VSRC1", 2)]),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 255), ("VSRC1", 0), ("LITERAL", 0x7FFF_FFF0)]),
+    ];
+
+    /// Integer VALU on a, b, c (`INT_INPUTS`): high products, 24-bit and 16-bit multiplies (OP_SEL
+    /// halves), bitfields with offset + width past 32 and width 0, align, SAD, min3 / max3 / med3,
+    /// clamped (saturating) adds, bit counts and scans of 0 and −1, packs that saturate.
+    pub(crate) const INT_ARITHMETIC: &[I] = &[
+        INT_INPUTS[0], INT_INPUTS[1], INT_INPUTS[2], INT_INPUTS[3], INT_INPUTS[4],
+        ("V_MUL_HI_U32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 1), ("SRC1", V + 2)]),
+        ("V_MUL_HI_I32", "ENC_VOP3", &[("VDST", 11), ("SRC0", V + 1), ("SRC1", V + 2)]),
+        ("V_MUL_U32_U24", "ENC_VOP2", &[("VDST", 12), ("SRC0", V + 1), ("VSRC1", 2)]),
+        ("V_MUL_HI_U32_U24", "ENC_VOP2", &[("VDST", 13), ("SRC0", V + 1), ("VSRC1", 2)]),
+        ("V_MUL_I32_I24", "ENC_VOP2", &[("VDST", 14), ("SRC0", V + 1), ("VSRC1", 2)]),
+        ("V_MUL_HI_I32_I24", "ENC_VOP2", &[("VDST", 15), ("SRC0", V + 1), ("VSRC1", 2)]),
+        ("V_MAD_U32_U24", "ENC_VOP3", &[("VDST", 16), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3)]),
+        ("V_MAD_I32_I24", "ENC_VOP3", &[("VDST", 17), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3)]),
+        // bfe(a, lane, 8) unsigned and signed, bfe(a, 4, lane), bfi, bfm(lane, 4)
+        ("V_BFE_U32", "ENC_VOP3", &[("VDST", 18), ("SRC0", V + 1), ("SRC1", V), ("SRC2", 136)]),
+        ("V_BFE_I32", "ENC_VOP3", &[("VDST", 19), ("SRC0", V + 1), ("SRC1", V), ("SRC2", 136)]),
+        ("V_BFE_U32", "ENC_VOP3", &[("VDST", 20), ("SRC0", V + 1), ("SRC1", 132), ("SRC2", V)]),
+        ("V_BFI_B32", "ENC_VOP3", &[("VDST", 21), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3)]),
+        ("V_BFM_B32", "ENC_VOP3", &[("VDST", 22), ("SRC0", V), ("SRC1", 132)]),
+        ("V_ALIGNBIT_B32", "ENC_VOP3", &[("VDST", 23), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V)]),
+        ("V_ALIGNBYTE_B32", "ENC_VOP3", &[("VDST", 24), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V)]),
+        ("V_XAD_U32", "ENC_VOP3", &[("VDST", 25), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3)]),
+        ("V_SAD_U8", "ENC_VOP3", &[("VDST", 26), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3)]),
+        ("V_SAD_HI_U8", "ENC_VOP3", &[("VDST", 27), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3)]),
+        ("V_SAD_U16", "ENC_VOP3", &[("VDST", 28), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3)]),
+        ("V_SAD_U32", "ENC_VOP3", &[("VDST", 29), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3)]),
+        ("V_MSAD_U8", "ENC_VOP3", &[("VDST", 30), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3)]),
+        ("V_MIN3_U32", "ENC_VOP3", &[("VDST", 31), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3)]),
+        ("V_MAX3_I32", "ENC_VOP3", &[("VDST", 32), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3)]),
+        ("V_MED3_U32", "ENC_VOP3", &[("VDST", 33), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3)]),
+        ("V_MED3_I32", "ENC_VOP3", &[("VDST", 34), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3)]),
+        ("V_MIN3_I32", "ENC_VOP3", &[("VDST", 35), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3)]),
+        ("V_MAX3_U32", "ENC_VOP3", &[("VDST", 36), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3)]),
+        // clamp: a + b + c, a + b, b − a (u32); a + c, b − c (i32); a + c without
+        ("V_ADD3_U32", "ENC_VOP3", &[("VDST", 37), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3), ("CLAMP", 1)]),
+        ("V_ADD_NC_U32", "ENC_VOP3", &[("VDST", 38), ("SRC0", V + 1), ("SRC1", V + 2), ("CLAMP", 1)]),
+        ("V_SUB_NC_U32", "ENC_VOP3", &[("VDST", 39), ("SRC0", V + 2), ("SRC1", V + 1), ("CLAMP", 1)]),
+        ("V_ADD_NC_I32", "ENC_VOP3", &[("VDST", 40), ("SRC0", V + 1), ("SRC1", V + 3), ("CLAMP", 1)]),
+        ("V_SUB_NC_I32", "ENC_VOP3", &[("VDST", 41), ("SRC0", V + 2), ("SRC1", V + 3), ("CLAMP", 1)]),
+        ("V_ADD_NC_I32", "ENC_VOP3", &[("VDST", 42), ("SRC0", V + 1), ("SRC1", V + 3)]),
+        // bcnt(a) + lane, ffbh / ffbl / ffbh_i32 (0 and −1 at lane 0), bfrev, not, xnor
+        ("V_BCNT_U32_B32", "ENC_VOP3", &[("VDST", 43), ("SRC0", V + 1), ("SRC1", V)]),
+        ("V_FFBH_U32", "ENC_VOP1", &[("VDST", 44), ("SRC0", V + 1)]),
+        ("V_FFBL_B32", "ENC_VOP1", &[("VDST", 45), ("SRC0", V + 2)]),
+        ("V_FFBH_I32", "ENC_VOP1", &[("VDST", 46), ("SRC0", V + 2)]),
+        ("V_BFREV_B32", "ENC_VOP1", &[("VDST", 47), ("SRC0", V + 1)]),
+        ("V_NOT_B32", "ENC_VOP1", &[("VDST", 48), ("SRC0", V + 2)]),
+        ("V_XNOR_B32", "ENC_VOP2", &[("VDST", 49), ("SRC0", V + 1), ("VSRC1", 2)]),
+        // packs of (a, b) to u16 and (b, c) to i16; 16-bit mads of a.hi · b.lo, a.lo · b.hi
+        ("V_CVT_PK_U16_U32", "ENC_VOP3", &[("VDST", 50), ("SRC0", V + 1), ("SRC1", V + 2)]),
+        ("V_CVT_PK_I16_I32", "ENC_VOP3", &[("VDST", 51), ("SRC0", V + 2), ("SRC1", V + 3)]),
+        ("V_MAD_U32_U16", "ENC_VOP3", &[("VDST", 52), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3), ("OP_SEL", 1)]),
+        ("V_MAD_I32_I16", "ENC_VOP3", &[("VDST", 53), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3), ("OP_SEL", 2)]),
+        ("V_MIN_I32", "ENC_VOP2", &[("VDST", 54), ("SRC0", V + 1), ("VSRC1", 2)]),
+        ("V_MAX_U32", "ENC_VOP2", &[("VDST", 55), ("SRC0", V + 1), ("VSRC1", 2)]),
+        ("V_LSHL_ADD_U32", "ENC_VOP3", &[("VDST", 56), ("SRC0", V + 1), ("SRC1", V), ("SRC2", V + 3)]),
+        ("V_ADD_LSHL_U32", "ENC_VOP3", &[("VDST", 57), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V)]),
+        ENDPGM,
+    ];
+
+    /// Carries on a, b, c (`INT_INPUTS`): VOP3 carry-outs into s20..s30 and carry-ins from them,
+    /// a VOP2 chain through VCC, a VOP3 cndmask on s22, v_mad_u64_u32 / v_mad_i64_i32 with their
+    /// carry-outs (s32, s34) and the 64-bit shifts by 2 · lane + 3 (65 at lane 31: 1).
+    pub(crate) const INT_CARRIES: &[I] = &[
+        INT_INPUTS[0], INT_INPUTS[1], INT_INPUTS[2], INT_INPUTS[3], INT_INPUTS[4],
+        ("V_ADD_CO_U32", "VOP3_SDST_ENC", &[("VDST", 10), ("SDST", 20), ("SRC0", V + 1), ("SRC1", V + 2)]),
+        ("V_ADD_CO_CI_U32", "VOP3_SDST_ENC", &[("VDST", 11), ("SDST", 22), ("SRC0", V + 1), ("SRC1", V + 3), ("SRC2", 20)]),
+        ("V_SUB_CO_U32", "VOP3_SDST_ENC", &[("VDST", 12), ("SDST", 24), ("SRC0", V + 1), ("SRC1", V + 2)]),
+        ("V_SUB_CO_CI_U32", "VOP3_SDST_ENC", &[("VDST", 13), ("SDST", 26), ("SRC0", V + 3), ("SRC1", V + 2), ("SRC2", 24)]),
+        ("V_SUBREV_CO_U32", "VOP3_SDST_ENC", &[("VDST", 14), ("SDST", 28), ("SRC0", V + 1), ("SRC1", V + 2)]),
+        ("V_SUBREV_CO_CI_U32", "VOP3_SDST_ENC", &[("VDST", 15), ("SDST", 30), ("SRC0", V + 2), ("SRC1", V + 3), ("SRC2", 28)]),
+        // vcc = a > b; a + b + vcc, c − a − vcc, a − c − vcc, each into vcc
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", V + 1), ("VSRC1", 2)]),
+        ("V_ADD_CO_CI_U32", "ENC_VOP2", &[("VDST", 16), ("SRC0", V + 1), ("VSRC1", 2)]),
+        ("V_SUB_CO_CI_U32", "ENC_VOP2", &[("VDST", 17), ("SRC0", V + 3), ("VSRC1", 1)]),
+        ("V_SUBREV_CO_CI_U32", "ENC_VOP2", &[("VDST", 18), ("SRC0", V + 3), ("VSRC1", 1)]),
+        ("V_CNDMASK_B32", "ENC_VOP3", &[("VDST", 19), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", 22)]),
+        // v[20:21] = a · b + (c | a << 32), v[24:25] the same signed; shifts of them and of v[22:23]
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 22), ("SRC0", V + 3)]),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 23), ("SRC0", V + 1)]),
+        ("V_MAD_U64_U32", "VOP3_SDST_ENC", &[("VDST", 20), ("SDST", 32), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 22)]),
+        ("V_MAD_I64_I32", "VOP3_SDST_ENC", &[("VDST", 24), ("SDST", 34), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 22)]),
+        ("V_LSHL_ADD_U32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V), ("SRC1", 129), ("SRC2", 131)]),
+        ("V_LSHLREV_B64", "ENC_VOP3", &[("VDST", 26), ("SRC0", V + 4), ("SRC1", V + 20)]),
+        ("V_LSHRREV_B64", "ENC_VOP3", &[("VDST", 28), ("SRC0", V + 4), ("SRC1", V + 22)]),
+        ("V_ASHRREV_I64", "ENC_VOP3", &[("VDST", 30), ("SRC0", V + 4), ("SRC1", V + 24)]),
+        ENDPGM,
+    ];
+
+    /// `INT_INPUTS`' a, b, c of a lane
+    fn int_inputs(l: usize) -> (u32, u32, u32) {
+        let a = (l as u32).wrapping_mul(0x9E37_79B9);
+        (a, (l as u32).wrapping_sub(a >> 13), 0x7FFF_FFF0 + l as u32)
+    }
+
+    pub(crate) fn check_int_arithmetic(_: &[u32], v: &[Vec<u32>]) {
+        let (u24, i24) = (|x: u32| (x & 0xFF_FFFF) as u64, |x: u32| ((x << 8) as i32 >> 8) as i64);
+        let i16s = |x: u32| x as u16 as i16 as i32;
+        let bytes = |x: u32| x.to_le_bytes().map(|b| b as i32);
+        let first = |n: u32, x: u32| if x == 0 { u32::MAX } else { n };
+        for (l, r) in v.iter().enumerate() {
+            let (a, b, c) = int_inputs(l);
+            let n = l as u32;
+            let (ai, bi, ci) = (a as i32, b as i32, c as i32);
+            assert_eq!((r[1], r[2], r[3]), (a, b, c), "lane {l}");
+            let mask = |w: u32| ((1u64 << w) - 1) as u32;
+            let sext = |x: u32, w: u32| if w == 0 { 0 } else { ((x << (32 - w)) as i32 >> (32 - w)) as u32 };
+            let (ba, bb) = (bytes(a), bytes(b));
+            let sad8: i32 = (0..4).map(|k| (ba[k] - bb[k]).abs()).sum();
+            let msad8: i32 = (0..4).filter(|&k| bb[k] != 0).map(|k| (ba[k] - bb[k]).abs()).sum();
+            let sad16 = (i16s(a) as u16 as i32 - b as u16 as i32).abs() + ((a >> 16) as i32 - (b >> 16) as i32).abs();
+            let med3 = |x: u32, y: u32, z: u32| x.min(y).max(x.max(y).min(z));
+            let med3i = |x: i32, y: i32, z: i32| x.min(y).max(x.max(y).min(z));
+            let ffbh_i = |x: u32| if x == 0 || x == u32::MAX { u32::MAX } else { (x ^ (x as i32 >> 31) as u32).leading_zeros() };
+            let want = [
+                ((a as u64 * b as u64) >> 32) as u32,
+                ((ai as i64 * bi as i64) >> 32) as u32,
+                (u24(a) * u24(b)) as u32,
+                ((u24(a) * u24(b)) >> 32) as u32,
+                (i24(a) * i24(b)) as u32,
+                ((i24(a) * i24(b)) >> 32) as u32,
+                ((u24(a) * u24(b)) as u32).wrapping_add(c),
+                ((i24(a) * i24(b)) as u32).wrapping_add(c),
+                a >> (n & 31) & mask(8),
+                sext((ai >> (n & 31)) as u32 & mask(8), 8),
+                a >> 4 & mask(n & 31),
+                a & b | !a & c,
+                mask(n & 31) << 4,
+                (((a as u64) << 32 | b as u64) >> (n & 31)) as u32,
+                (((a as u64) << 32 | b as u64) >> (8 * (n & 3))) as u32,
+                (a ^ b).wrapping_add(c),
+                (sad8 as u32).wrapping_add(c),
+                ((sad8 as u32) << 16).wrapping_add(c),
+                (sad16 as u32).wrapping_add(c),
+                a.abs_diff(b).wrapping_add(c),
+                (msad8 as u32).wrapping_add(c),
+                a.min(b).min(c),
+                ai.max(bi).max(ci) as u32,
+                med3(a, b, c),
+                med3i(ai, bi, ci) as u32,
+                ai.min(bi).min(ci) as u32,
+                a.max(b).max(c),
+                (a as u64 + b as u64 + c as u64).min(u32::MAX as u64) as u32,
+                a.saturating_add(b),
+                b.saturating_sub(a),
+                ai.saturating_add(ci) as u32,
+                bi.saturating_sub(ci) as u32,
+                a.wrapping_add(c),
+                a.count_ones() + n,
+                first(a.leading_zeros(), a),
+                first(b.trailing_zeros(), b),
+                ffbh_i(b),
+                a.reverse_bits(),
+                !b,
+                !(a ^ b),
+                a.min(0xFFFF) | b.min(0xFFFF) << 16,
+                bi.clamp(-32768, 32767) as u32 & 0xFFFF | (ci.clamp(-32768, 32767) as u32) << 16,
+                (a >> 16).wrapping_mul(b & 0xFFFF).wrapping_add(c),
+                (i16s(a) * i16s(b >> 16)).wrapping_add(ci) as u32,
+                ai.min(bi) as u32,
+                a.max(b),
+                (a << (n & 31)).wrapping_add(c),
+                a.wrapping_add(b) << (n & 31),
+            ];
+            for (k, w) in want.iter().enumerate() {
+                assert_eq!(r[10 + k], *w, "lane {l} v{}: {:#x} against {w:#x}", 10 + k, r[10 + k]);
+            }
+        }
+    }
+
+    pub(crate) fn check_int_carries(s: &[u32], v: &[Vec<u32>]) {
+        let mut masks = [0u32; 8];
+        for (l, r) in v.iter().enumerate() {
+            let (a, b, c) = int_inputs(l);
+            let (a64, b64, c64) = (a as u64, b as u64, c as u64);
+            let bit = |m: u32| (m >> l & 1) as u64;
+            let carry = [a64 + b64 > u32::MAX as u64, a64 + c64 + bit(s[20]) > u32::MAX as u64, b > a, b64 + bit(s[24]) > c64, a > b, b64 + bit(s[28]) > c64];
+            let want = [a.wrapping_add(b), (a64 + c64 + bit(s[20])) as u32, a.wrapping_sub(b), (c64.wrapping_sub(b64 + bit(s[24]))) as u32, b.wrapping_sub(a), (c64.wrapping_sub(b64 + bit(s[28]))) as u32];
+            for k in 0..6 {
+                assert_eq!(r[10 + k], want[k], "lane {l} v{}", 10 + k);
+                masks[k] |= (carry[k] as u32) << l;
+            }
+            // the VCC chain
+            let v0 = (a > b) as u64;
+            let w16 = a64 + b64 + v0;
+            let v1 = (w16 >> 32) as u64;
+            let v2 = (a64 + v1 > c64) as u64;
+            let v3 = (c64 + v2 > a64) as u64;
+            assert_eq!([r[16], r[17], r[18]], [w16 as u32, c64.wrapping_sub(a64 + v1) as u32, a64.wrapping_sub(c64 + v2) as u32], "lane {l}: through vcc");
+            masks[6] |= (v3 as u32) << l;
+            assert_eq!(r[19], if bit(s[22]) == 1 { b } else { a }, "lane {l}: cndmask");
+            let addend = c64 | a64 << 32;
+            let (wu, cu) = (a64 * b64).overflowing_add(addend);
+            let wi = ((a as i32 as i64 * b as i32 as i64) as u64).wrapping_add(addend);
+            masks[7] |= (cu as u32) << l;
+            let sh = (2 * l as u32 + 3) & 63;
+            let pair = |i: usize| r[i] as u64 | (r[i + 1] as u64) << 32;
+            assert_eq!([pair(20), pair(22), pair(24)], [wu, addend, wi], "lane {l}: mads");
+            assert_eq!([pair(26), pair(28), pair(30)], [wu << sh, addend >> sh, ((wi as i64) >> sh) as u64], "lane {l}: 64-bit shifts");
+        }
+        let got = [s[20], s[22], s[24], s[26], s[28], s[30], s[106], s[32]];
+        assert_eq!(got, masks, "carry-outs s20..s30, vcc, s32");
+    }
+
     pub(crate) fn compute_cs() -> crate::gpu::recomp::CsInterface {
         crate::gpu::recomp::CsInterface { threads: [64, 1, 1], user_sgprs: 2, tgid: [true, false, false], tg_size: false, tid_components: 1 }
     }
