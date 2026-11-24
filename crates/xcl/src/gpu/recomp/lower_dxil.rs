@@ -164,6 +164,8 @@ impl Ir for DxilIr {
             FBin::Add => self.s.m.fbin(BinOp::Add, a, b, 0),
             FBin::Sub => self.s.m.fbin(BinOp::Sub, a, b, 0),
             FBin::Mul => self.s.m.fbin(BinOp::Mul, a, b, 0),
+            // `fdiv` (bitcode BINOP_SDIV on floats), as `Lw::fdiv`
+            FBin::Div => self.s.m.fbin(BinOp::SDiv, a, b, 0),
             FBin::Min => self.s.binary(Binary::FMin, a, b),
             FBin::Max => self.s.binary(Binary::FMax, a, b),
         };
@@ -183,6 +185,15 @@ impl Ir for DxilIr {
             }
             FUn::Sat => self.s.funary(FUnary::Saturate, a),
             FUn::Floor => self.s.funary(FUnary::RoundNi, a),
+            FUn::Ceil => self.s.funary(FUnary::RoundPi, a),
+            FUn::Trunc => self.s.funary(FUnary::RoundZ, a),
+            FUn::RoundNe => self.s.funary(FUnary::RoundNe, a),
+            FUn::Sqrt => self.s.funary(FUnary::Sqrt, a),
+            FUn::Rsq => self.s.funary(FUnary::Rsqrt, a),
+            FUn::Exp => self.s.funary(FUnary::Exp, a),
+            FUn::Log => self.s.funary(FUnary::Log, a),
+            FUn::Sin => self.s.funary(FUnary::Sin, a),
+            FUn::Cos => self.s.funary(FUnary::Cos, a),
             FUn::F16ToF32 => unreachable!(),
         };
         self.bits(r)
@@ -305,7 +316,7 @@ mod tests {
         if !gpu() {
             return;
         }
-        for (name, lines) in [("straight", STRAIGHT), ("skipped if", SKIPPED_IF), ("leaving loop", LEAVING_LOOP), ("uniform loop", UNIFORM_LOOP), ("memory", MEMORY), ("f32 arithmetic", F32_ARITHMETIC), ("f32 compares", F32_COMPARES), ("f32 conversions", F32_CONVERSIONS)] {
+        for (name, lines) in [("straight", STRAIGHT), ("skipped if", SKIPPED_IF), ("leaving loop", LEAVING_LOOP), ("uniform loop", UNIFORM_LOOP), ("memory", MEMORY), ("f32 arithmetic", F32_ARITHMETIC), ("f32 compares", F32_COMPARES), ("f32 conversions", F32_CONVERSIONS), ("f32 rounding", F32_ROUNDING)] {
             let insts = decode(lines);
             let (dxil, stale) = super::kernel(&insts, false).unwrap_or_else(|e| panic!("{name}: {e}"));
             let (s, v) = state(32);
@@ -333,6 +344,49 @@ mod tests {
                 for &r in &vregs {
                     assert_eq!(gpu.vgpr[l][r], cv[l][r], "{name}: lane {l} v{r}");
                 }
+            }
+        }
+    }
+
+    /// The transcendentals: the per-lane DXIL and the HLSL path on the GPU give the same bits
+    /// (the same DXIL operations; rcp within the tolerance below, as HLSL's `rcp` is a fast
+    /// `fdiv`), and the CPU's are within `approximate_float_unary_ops_are_within_tolerance`'s.
+    #[test]
+    fn per_lane_transcendentals_agree_with_the_hlsl_path_on_the_gpu() {
+        if !gpu() {
+            return;
+        }
+        if dxc::location().is_err() {
+            runner::skip_test("no DXC");
+            return;
+        }
+        let lines = F32_TRANSCENDENTALS;
+        let (dxil, _) = super::kernel(&decode(lines), false).unwrap();
+        let (s, v) = state(32);
+        let mut st = runner::KernelState::default();
+        st.sgpr.copy_from_slice(&s);
+        for (l, regs) in v.iter().enumerate() {
+            st.vgpr[l][..regs.len()].copy_from_slice(regs);
+        }
+        let direct = runner::run(&dxil, &st, &[]).unwrap();
+        let bytes: Vec<u8> = lines.iter().flat_map(encode_line).collect();
+        let t = translate(&bytes, &Options { wave64: false, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let hlsl = runner::run(&dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap(), &st, &[]).unwrap();
+        let (_, cpu, _) = run_mem(lines, false, &s, &v, &[]);
+        let close = |a: u32, b: u32| {
+            let (a, b) = (f32::from_bits(a), f32::from_bits(b));
+            a.to_bits() == b.to_bits() || (a - b).abs() <= 1e-3f32.max(b.abs() * 1e-5)
+        };
+        for l in 0..32 {
+            for r in 1..=13 {
+                let (d, h) = (direct.vgpr[l][r], hlsl.vgpr[l][r]);
+                if r == 3 || r == 4 {
+                    assert!(close(d, h), "lane {l} v{r}: {} against {}", f32::from_bits(d), f32::from_bits(h));
+                } else {
+                    assert_eq!(d, h, "lane {l} v{r}: {} against {}", f32::from_bits(d), f32::from_bits(h));
+                }
+                assert!(close(cpu[l][r], h), "lane {l} v{r}: CPU {} against {}", f32::from_bits(cpu[l][r]), f32::from_bits(h));
             }
         }
     }

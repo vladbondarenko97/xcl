@@ -59,6 +59,7 @@ pub enum FBin {
     Add,
     Sub,
     Mul,
+    Div,
     Min,
     Max,
 }
@@ -83,7 +84,8 @@ pub enum FCmp {
 }
 
 /// `Abs` and `Neg` as HLSL's `abs` / `-x`; `Sat` is `saturate` (NaN gives 0); `Floor` is
-/// `floor`; `F16ToF32` is `f16tof32` of the dword's low 16 bits
+/// `floor`; `F16ToF32` is `f16tof32` of the dword's low 16 bits; the others are the HLSL
+/// intrinsics of their names (`Exp` / `Log` base 2, `RoundNe` HLSL's `round`)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FUn {
     Abs,
@@ -91,6 +93,15 @@ pub enum FUn {
     Sat,
     Floor,
     F16ToF32,
+    Ceil,
+    Trunc,
+    RoundNe,
+    Sqrt,
+    Rsq,
+    Exp,
+    Log,
+    Sin,
+    Cos,
 }
 
 /// What the lowering needs from the DXIL module builder. Blocks are numbered in the order
@@ -148,6 +159,8 @@ const EXEC: u8 = 126;
 const F32_ARITH: &[&str] = &[
     "V_ADD_F32", "V_SUB_F32", "V_SUBREV_F32", "V_MUL_F32", "V_MIN_F32", "V_MAX_F32", "V_FMA_F32", "V_MAD_F32", "V_MAC_F32", "V_FMAC_F32",
     "V_CVT_F32_I32", "V_CVT_F32_U32", "V_CVT_U32_F32", "V_CVT_I32_F32", "V_CVT_RPI_I32_F32", "V_CVT_FLR_I32_F32", "V_CVT_F32_F16", "V_CVT_F16_F32",
+    "V_RCP_F32", "V_RCP_IFLAG_F32", "V_RSQ_F32", "V_SQRT_F32", "V_EXP_F32", "V_LOG_F32", "V_SIN_F32", "V_COS_F32",
+    "V_FLOOR_F32", "V_CEIL_F32", "V_TRUNC_F32", "V_RNDNE_F32", "V_FRACT_F32",
 ];
 const VCC: u8 = 106;
 
@@ -721,6 +734,8 @@ impl<'a, I: Ir> Lower<'a, I> {
         let n = match name {
             "V_FMA_F32" | "V_MAD_F32" => 3,
             n if n.starts_with("V_CVT_") => 1,
+            "V_RCP_F32" | "V_RCP_IFLAG_F32" | "V_RSQ_F32" | "V_SQRT_F32" | "V_EXP_F32" | "V_LOG_F32" | "V_SIN_F32" | "V_COS_F32" => 1,
+            "V_FLOOR_F32" | "V_CEIL_F32" | "V_TRUNC_F32" | "V_RNDNE_F32" | "V_FRACT_F32" => 1,
             _ => 2,
         };
         let mut x = Vec::new();
@@ -778,6 +793,37 @@ impl<'a, I: Ir> Lower<'a, I> {
             "V_MIN_F32" => self.ir.fbin(FBin::Min, x[0], x[1]),
             "V_MAX_F32" => self.ir.fbin(FBin::Max, x[0], x[1]),
             "V_FMA_F32" | "V_FMAC_F32" => self.ir.fmad(x[0], x[1], x[2]),
+            // rcp is HLSL's `rcp` (1 / x); sin and cos take turns: x · 2π first, as `emit.rs`
+            "V_RCP_F32" | "V_RCP_IFLAG_F32" => {
+                let one = self.ir.int(1.0f32.to_bits());
+                self.ir.fbin(FBin::Div, one, x[0])
+            }
+            "V_SIN_F32" | "V_COS_F32" => {
+                let k = self.ir.int(6.283_185_3f32.to_bits());
+                let t = self.ir.fbin(FBin::Mul, x[0], k);
+                self.ir.fun(if name == "V_SIN_F32" { FUn::Sin } else { FUn::Cos }, t)
+            }
+            // `fract_f`: x − floor(x), below 1.0
+            "V_FRACT_F32" => {
+                let fl = self.ir.fun(FUn::Floor, x[0]);
+                let r = self.ir.fbin(FBin::Sub, x[0], fl);
+                let one = self.ir.int(1.0f32.to_bits());
+                let ge = self.ir.fcmp(FCmp::Ge, r, one);
+                self.sel_k(ge, 0x3F7F_FFFF, r)
+            }
+            "V_RSQ_F32" | "V_SQRT_F32" | "V_EXP_F32" | "V_LOG_F32" | "V_FLOOR_F32" | "V_CEIL_F32" | "V_TRUNC_F32" | "V_RNDNE_F32" => {
+                let op = match name {
+                    "V_RSQ_F32" => FUn::Rsq,
+                    "V_SQRT_F32" => FUn::Sqrt,
+                    "V_EXP_F32" => FUn::Exp,
+                    "V_LOG_F32" => FUn::Log,
+                    "V_FLOOR_F32" => FUn::Floor,
+                    "V_CEIL_F32" => FUn::Ceil,
+                    "V_TRUNC_F32" => FUn::Trunc,
+                    _ => FUn::RoundNe,
+                };
+                self.ir.fun(op, x[0])
+            }
             _ => {
                 let p = self.ir.fbin(FBin::Mul, x[0], x[1]);
                 self.ir.fbin(FBin::Add, p, x[2])
@@ -1886,6 +1932,7 @@ pub(crate) mod tests {
                                         FBin::Add => a + b,
                                         FBin::Sub => a - b,
                                         FBin::Mul => a * b,
+                                        FBin::Div => a / b,
                                         FBin::Min => a.min(b),
                                         FBin::Max => a.max(b),
                                     }.to_bits())
@@ -1899,6 +1946,16 @@ pub(crate) mod tests {
                                         FUn::Sat => if a.is_nan() { 0.0 } else { a.clamp(0.0, 1.0) },
                                         FUn::Floor => a.floor(),
                                         FUn::F16ToF32 => f16_to_f32(g_bits),
+                                        FUn::Ceil => a.ceil(),
+                                        FUn::Trunc => a.trunc(),
+                                        FUn::RoundNe => a.round_ties_even(),
+                                        // the GPU's are approximate: tests compare these with a tolerance
+                                        FUn::Sqrt => a.sqrt(),
+                                        FUn::Rsq => 1.0 / a.sqrt(),
+                                        FUn::Exp => a.exp2(),
+                                        FUn::Log => a.log2(),
+                                        FUn::Sin => a.sin(),
+                                        FUn::Cos => a.cos(),
                                     }.to_bits())
                                 }
                                 // out of range only where the lowering selects something else
@@ -2203,6 +2260,45 @@ pub(crate) mod tests {
         ("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 30), ("SRC0", V + 19)]),
         ("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 31), ("SRC0", V + 11)]),
         ("V_CVT_F16_F32", "ENC_VOP3", &[("VDST", 32), ("SRC0", V + 6), ("CLAMP", 1)]),
+        ENDPGM,
+    ];
+
+    /// floor / ceil / trunc / rndne / fract of v3 = (lane − 16) / 8 (ties, signed zeros), fract
+    /// of −2^-30 (just below 1.0), and two with VOP3 modifiers.
+    pub(crate) const F32_ROUNDING: &[I] = &[
+        ("V_SUBREV_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 144), ("VSRC1", 0)]),
+        ("V_CVT_F32_I32", "ENC_VOP1", &[("VDST", 2), ("SRC0", V + 1)]),
+        ("V_MUL_F32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 255), ("VSRC1", 2), ("LITERAL", 0x3E00_0000)]),
+        ("V_FLOOR_F32", "ENC_VOP1", &[("VDST", 4), ("SRC0", V + 3)]),
+        ("V_CEIL_F32", "ENC_VOP1", &[("VDST", 5), ("SRC0", V + 3)]),
+        ("V_TRUNC_F32", "ENC_VOP1", &[("VDST", 6), ("SRC0", V + 3)]),
+        ("V_RNDNE_F32", "ENC_VOP1", &[("VDST", 7), ("SRC0", V + 3)]),
+        ("V_FRACT_F32", "ENC_VOP1", &[("VDST", 8), ("SRC0", V + 3)]),
+        ("V_FRACT_F32", "ENC_VOP1", &[("VDST", 9), ("SRC0", 255), ("LITERAL", 0xB080_0000)]),
+        ("V_FLOOR_F32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 3), ("NEG", 1), ("OMOD", 1)]),
+        ("V_FRACT_F32", "ENC_VOP3", &[("VDST", 11), ("SRC0", V + 3), ("ABS", 1), ("CLAMP", 1)]),
+        ENDPGM,
+    ];
+
+    /// rcp / rsq / sqrt / log of v1 = 1 + (lane & 31) / 32, exp / sin / cos of v2 = v1 − 1.5,
+    /// and three with VOP3 modifiers (log2 |0| = −∞ at lane 16). The GPU's are approximate.
+    pub(crate) const F32_TRANSCENDENTALS: &[I] = &[
+        ("V_AND_B32", "ENC_VOP2", &[("VDST", 23), ("SRC0", 159), ("VSRC1", 0)]),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 146), ("VSRC1", 23)]),
+        ("V_OR_B32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 255), ("VSRC1", 1), ("LITERAL", 0x3F80_0000)]),
+        ("V_ADD_F32", "ENC_VOP3", &[("VDST", 2), ("SRC0", V + 1), ("SRC1", 243)]),
+        ("V_ADD_F32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 241), ("VSRC1", 2)]),
+        ("V_RCP_F32", "ENC_VOP1", &[("VDST", 3), ("SRC0", V + 1)]),
+        ("V_RCP_IFLAG_F32", "ENC_VOP1", &[("VDST", 4), ("SRC0", V + 1)]),
+        ("V_RSQ_F32", "ENC_VOP1", &[("VDST", 5), ("SRC0", V + 1)]),
+        ("V_SQRT_F32", "ENC_VOP1", &[("VDST", 6), ("SRC0", V + 1)]),
+        ("V_EXP_F32", "ENC_VOP1", &[("VDST", 7), ("SRC0", V + 2)]),
+        ("V_LOG_F32", "ENC_VOP1", &[("VDST", 8), ("SRC0", V + 1)]),
+        ("V_SIN_F32", "ENC_VOP1", &[("VDST", 9), ("SRC0", V + 2)]),
+        ("V_COS_F32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V + 2)]),
+        ("V_EXP_F32", "ENC_VOP3", &[("VDST", 11), ("SRC0", V + 2), ("NEG", 1), ("OMOD", 1)]),
+        ("V_SIN_F32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 2), ("CLAMP", 1)]),
+        ("V_LOG_F32", "ENC_VOP3", &[("VDST", 13), ("SRC0", V + 2), ("ABS", 1)]),
         ENDPGM,
     ];
 
@@ -2655,6 +2751,37 @@ pub(crate) mod tests {
             return;
         }
         agrees_with_hlsl("f32 conversions, wave64", F32_CONVERSIONS, true, &[]);
+    }
+
+    #[test]
+    fn f32_rounding() {
+        let (s, v) = state(32);
+        let (_, v) = run(F32_ROUNDING, false, &s, &v);
+        for (l, r) in v.iter().enumerate() {
+            let x = (l as i32 - 16) as f32 / 8.0;
+            let want = [x.floor(), x.ceil(), x.trunc(), x.round_ties_even(), x - x.floor()];
+            for (i, w) in want.iter().enumerate() {
+                assert_eq!(r[4 + i], w.to_bits(), "lane {l} v{}", 4 + i);
+            }
+            assert_eq!(r[9], 0x3F7F_FFFF, "fract(-2^-30): below 1.0");
+            assert_eq!(f32::from_bits(r[10]), 2.0 * (-x).floor(), "lane {l}");
+            assert_eq!(f32::from_bits(r[11]), x.abs() - x.abs().floor(), "lane {l}");
+        }
+    }
+
+    #[test]
+    fn f32_rounding_agrees_with_the_hlsl_path_on_the_gpu() {
+        use super::super::{dxc, runner};
+        if runner::adapter().is_err() || dxc::location().is_err() {
+            runner::skip_test(if runner::adapter().is_err() { "no GPU" } else { "no DXC" });
+            return;
+        }
+        agrees_with_hlsl("f32 rounding, wave32", F32_ROUNDING, false, &[]);
+        if runner::wave64_supported() != Ok(true) {
+            runner::skip_test("no wave64");
+            return;
+        }
+        agrees_with_hlsl("f32 rounding, wave64", F32_ROUNDING, true, &[]);
     }
 
     #[test]
