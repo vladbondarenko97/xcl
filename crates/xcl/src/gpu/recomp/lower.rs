@@ -68,6 +68,10 @@ pub trait Ir: Sink {
     fn ballot(&mut self, c: Self::V) -> [Self::V; 2];
     fn io_load(&mut self, dword: Self::V) -> Self::V;
     fn res_store(&mut self, dword: Self::V, value: Self::V);
+    /// the dword of the flat memory (`mem`, u2) at a byte address (a multiple of 4); out of
+    /// range reads 0 and writes nothing, as D3D12 raw buffers do
+    fn mem_load(&mut self, addr: Self::V) -> Self::V;
+    fn mem_store(&mut self, addr: Self::V, value: Self::V);
     fn br(&mut self, target: usize);
     fn br_if(&mut self, c: Self::V, then: usize, otherwise: usize);
     fn ret(&mut self);
@@ -95,6 +99,12 @@ struct Lower<'a, I: Ir> {
     /// the IR block each mask bit was written in, and the mask bits read (block, value)
     def_block: std::collections::HashMap<I::V, usize>,
     lane_uses: Vec<(usize, I::V)>,
+}
+
+/// A vector memory store: a side effect inactive lanes must not have.
+fn is_store(d: &Decoded) -> bool {
+    let n = d.inst.name;
+    (n.starts_with("GLOBAL_STORE_") || n.starts_with("FLAT_STORE_")) && matches!(d.enc.name, "ENC_FLAT_GLBL" | "ENC_FLAT")
 }
 
 /// IR block of analysis block b (block 0 is the prologue).
@@ -496,6 +506,92 @@ impl<'a, I: Ir> Lower<'a, I> {
         self.write_v(b, d, vdst as u16, v)
     }
 
+    /// `s_load_dword{,x2,x4,x8,x16}`: dwords of the flat memory into SGPRs, from
+    /// `s[sbase] + offset + soffset` (one memory window, as `emit::smem` with `mem_windows` 1).
+    fn smem(&mut self, b: usize, d: &Decoded) -> R<()> {
+        let name = d.inst.name;
+        let count = match name.strip_prefix("S_LOAD_") {
+            Some("DWORD") => 1,
+            Some("DWORDX2") => 2,
+            Some("DWORDX4") => 4,
+            Some("DWORDX8") => 8,
+            Some("DWORDX16") => 16,
+            _ => return Err(format!("unsupported {name}")),
+        };
+        let fv = |f: &str| rdna2::field_value(d.enc, &d.words, f).unwrap_or(0) * rdna2::register_scale(f);
+        let (sdata, sbase) = (fv("SDATA") as u8, fv("SBASE") as u8);
+        let imm = (((fv("OFFSET") as u32) << 11) as i32 >> 11) as u32; // 21-bit signed
+        let soff = rdna2::field_value(d.enc, &d.words, "SOFFSET").unwrap_or(125);
+        let base = self.read_num(b, sbase)?;
+        let imm = self.ir.int(imm);
+        let mut a = self.ir.bin(Bin::Add, base, imm);
+        if soff != 125 {
+            let s = self.src(b, d, soff)?;
+            a = self.ir.bin(Bin::Add, a, s);
+        }
+        let m = self.ir.int(!3);
+        let a = self.ir.bin(Bin::And, a, m);
+        let vals: Vec<I::V> = (0..count)
+            .map(|i| {
+                let o = self.ir.int(4 * i as u32);
+                let ai = self.ir.bin(Bin::Add, a, o);
+                self.ir.mem_load(ai)
+            })
+            .collect();
+        for (i, v) in vals.into_iter().enumerate() {
+            self.write_num(b, sdata + i as u8, v);
+        }
+        Ok(())
+    }
+
+    /// `global_` / `flat_` `load` / `store_dword{,x2,x3,x4}` on the flat memory. A guarded load
+    /// keeps the old register in lanes without their EXEC bit (`write_v`); a guarded store is
+    /// lowered in a block only those lanes enter (the caller's split).
+    fn vmem(&mut self, b: usize, d: &Decoded) -> R<()> {
+        let name = d.inst.name;
+        let op = name.trim_start_matches("GLOBAL_").trim_start_matches("FLAT_");
+        let (store, count) = match op {
+            "LOAD_DWORD" => (false, 1),
+            "LOAD_DWORDX2" => (false, 2),
+            "LOAD_DWORDX3" => (false, 3),
+            "LOAD_DWORDX4" => (false, 4),
+            "STORE_DWORD" => (true, 1),
+            "STORE_DWORDX2" => (true, 2),
+            "STORE_DWORDX3" => (true, 3),
+            "STORE_DWORDX4" => (true, 4),
+            _ => return Err(format!("unsupported {name}")),
+        };
+        let global = d.enc.name == "ENC_FLAT_GLBL";
+        if !global && d.enc.name != "ENC_FLAT" {
+            return Err(format!("{name}: {}", d.enc.name));
+        }
+        let fv = |f: &str| rdna2::field_value(d.enc, &d.words, f).unwrap_or(0);
+        let raw = fv("OFFSET") as u32;
+        let off = if global { ((raw << 20) as i32 >> 20) as u32 } else { raw };
+        let saddr = fv("SADDR");
+        let mut a = self.read(b, Var::V(fv("ADDR") as u16));
+        if global && saddr != 0x7D && saddr != 0x7F {
+            let s = self.read_num(b, saddr as u8)?;
+            a = self.ir.bin(Bin::Add, s, a);
+        }
+        let off = self.ir.int(off);
+        let a = self.ir.bin(Bin::Add, a, off);
+        for i in 0..count {
+            let o = self.ir.int(4 * i as u32);
+            let ai = self.ir.bin(Bin::Add, a, o);
+            let m = self.ir.int(!3);
+            let ai = self.ir.bin(Bin::And, ai, m);
+            if store {
+                let v = self.read(b, Var::V(fv("DATA") as u16 + i as u16));
+                self.ir.mem_store(ai, v);
+            } else {
+                let v = self.ir.mem_load(ai);
+                self.write_v(b, d, fv("VDST") as u16 + i as u16, v)?;
+            }
+        }
+        Ok(())
+    }
+
     /// The condition under which a lane takes the branch ending block b.
     fn cond(&mut self, b: usize, d: &Decoded) -> R<I::V> {
         Ok(match d.inst.name {
@@ -627,30 +723,55 @@ pub fn lower_kernel<I: Ir>(insts: &[Decoded], wave64: bool, mut ir: I) -> R<(I, 
     if n == 0 {
         return Err("empty program".into());
     }
-    let mut partial = vec![false; n + 5];
+    // IR blocks: 0 prologue, 1..=n the program's, n + 1 exit, n + 2 lane 0's scalar stores,
+    // n + 3 every lane's vector stores, n + 4 the way to the exit of lanes outside EXEC at launch,
+    // then for every guarded store (only the lanes with their EXEC bit may write): the block of
+    // the store and the one the rest of its block continues in. `tail[b]`: the IR block the
+    // program's block b ends in.
+    let (exit, sstore, vstore, skip) = (n + 1, n + 2, n + 3, n + 4);
+    let guarded: HashSet<u64> = sum.guarded.iter().copied().collect();
+    let mut splits: Vec<Vec<(usize, usize, usize)>> = vec![Vec::new(); n]; // (inst, store, cont)
+    let mut count = n + 5;
+    for (b, block) in sum.blocks.iter().enumerate() {
+        for i in block.insts.clone() {
+            if is_store(&insts[i]) && guarded.contains(&insts[i].pc) {
+                splits[b].push((i, count, count + 1));
+                count += 2;
+            }
+        }
+    }
+    let tail: Vec<usize> = (0..n).map(|b| splits[b].last().map_or(blk(b), |s| s.2)).collect();
+    let mut partial = vec![false; count];
     for (b, p) in partial_blocks(&sum).into_iter().enumerate() {
         partial[blk(b)] = p;
+        for &(_, s, c) in &splits[b] {
+            partial[s] = true;
+            partial[c] = p;
+        }
     }
-    // IR blocks: 0 prologue, 1..=n the program's, n + 1 exit, n + 2 lane 0's scalar stores,
-    // n + 3 every lane's vector stores, n + 4 the way to the exit of lanes outside EXEC at launch
-    let (exit, sstore, vstore, skip) = (n + 1, n + 2, n + 3, n + 4);
     let ends: Vec<usize> = sum.order.iter().copied().filter(|&b| sum.blocks[b].succ.is_empty()).collect();
-    let mut preds = vec![Vec::new(); n + 5];
+    let mut preds = vec![Vec::new(); count];
     preds[blk(0)] = vec![0];
     for &b in &sum.order {
         let mut seen = Vec::new();
         for &(s, _) in &sum.blocks[b].succ {
             if !seen.contains(&s) {
                 seen.push(s);
-                preds[blk(s)].push(blk(b));
+                preds[blk(s)].push(tail[b]);
             }
+        }
+        let mut prev = blk(b);
+        for &(_, s, c) in &splits[b] {
+            preds[s] = vec![prev];
+            preds[c] = vec![prev, s];
+            prev = c;
         }
     }
     preds[skip] = vec![0];
-    preds[exit] = std::iter::once(skip).chain(ends.iter().map(|&b| blk(b))).collect();
+    preds[exit] = std::iter::once(skip).chain(ends.iter().map(|&b| tail[b])).collect();
     preds[sstore] = vec![exit];
     preds[vstore] = vec![exit, sstore];
-    for i in 0..n + 5 {
+    for i in 0..count {
         let id = ir.new_block();
         debug_assert_eq!(id, i);
     }
@@ -661,7 +782,7 @@ pub fn lower_kernel<I: Ir>(insts: &[Decoded], wave64: bool, mut ir: I) -> R<(I, 
         ir,
 
         sum: &sum,
-        guarded: sum.guarded.iter().copied().collect(),
+        guarded,
         wave64,
         num_marker,
         bit_marker,
@@ -723,7 +844,7 @@ pub fn lower_kernel<I: Ir>(insts: &[Decoded], wave64: bool, mut ir: I) -> R<(I, 
     l.ir.br(exit);
 
     // the program, in reverse postorder; a block is sealed once all its predecessors are in
-    let mut done = vec![false; n + 5];
+    let mut done = vec![false; count];
     done[0] = true;
     done[skip] = true;
     let seal_ready = |l: &mut Lower<I>, done: &[bool], b: usize| {
@@ -734,7 +855,7 @@ pub fn lower_kernel<I: Ir>(insts: &[Decoded], wave64: bool, mut ir: I) -> R<(I, 
             false
         }
     };
-    let mut sealed = vec![false; n + 5];
+    let mut sealed = vec![false; count];
     sealed[0] = true;
     for &b in &sum.order.clone() {
         let ib = blk(b);
@@ -749,16 +870,35 @@ pub fn lower_kernel<I: Ir>(insts: &[Decoded], wave64: bool, mut ir: I) -> R<(I, 
         }
         let block = &sum.blocks[b];
         let last = block.insts.end - 1;
+        let mut cur = ib;
+        let mut split = splits[b].iter().peekable();
         for i in block.insts.clone() {
             let d = &insts[i];
             let name = d.inst.name;
             if i == last && (name.starts_with("S_CBRANCH") || name == "S_BRANCH" || name.starts_with("S_ENDPGM")) {
                 break;
             }
-            if name.starts_with("S_") {
-                l.salu(ib, d)?;
+            if let Some(&(_, s, c)) = split.next_if(|x| x.0 == i) {
+                // a guarded store: only the lanes with their EXEC bit go through its block
+                let e = l.read_bit(cur, EXEC)?;
+                l.ir.br_if(e, s, c);
+                done[cur] = true;
+                l.ir.at(s);
+                l.ssa.seal(&mut l.ir, s);
+                l.vmem(s, d)?;
+                l.ir.br(c);
+                done[s] = true;
+                l.ir.at(c);
+                l.ssa.seal(&mut l.ir, c);
+                cur = c;
+            } else if name.starts_with("S_LOAD_") || name.starts_with("S_BUFFER_LOAD_") {
+                l.smem(cur, d)?;
+            } else if name.starts_with("S_") {
+                l.salu(cur, d)?;
             } else if name.starts_with("V_") {
-                l.valu(ib, d)?;
+                l.valu(cur, d)?;
+            } else if name.starts_with("GLOBAL_") || name.starts_with("FLAT_") {
+                l.vmem(cur, d)?;
             } else {
                 return Err(format!("unsupported {name}"));
             }
@@ -768,12 +908,12 @@ pub fn lower_kernel<I: Ir>(insts: &[Decoded], wave64: bool, mut ir: I) -> R<(I, 
             [(t, Edge::Always)] => l.ir.br(blk(*t)),
             [(t, _), (f, _)] if t == f => l.ir.br(blk(*t)),
             [(t, Edge::Taken), (f, Edge::NotTaken)] => {
-                let c = l.cond(ib, &insts[last])?;
+                let c = l.cond(cur, &insts[last])?;
                 l.ir.br_if(c, blk(*t), blk(*f));
             }
             s => return Err(format!("block {b}: successors {s:?}")),
         }
-        done[ib] = true;
+        done[cur] = true;
         for &(s, _) in &block.succ {
             let is = blk(s);
             if !sealed[is] && l.sum.order.contains(&s) {
@@ -893,6 +1033,8 @@ mod tests {
         Ballot(u32, usize),
         IoLoad(u32),
         ResStore(u32, u32),
+        MemLoad(u32),
+        MemStore(u32, u32),
         Phi(Vec<(u32, usize)>),
     }
 
@@ -1004,6 +1146,12 @@ mod tests {
         fn res_store(&mut self, dword: u32, value: u32) {
             self.push(Ins::ResStore(dword, value));
         }
+        fn mem_load(&mut self, addr: u32) -> u32 {
+            self.push(Ins::MemLoad(addr))
+        }
+        fn mem_store(&mut self, addr: u32, value: u32) {
+            self.push(Ins::MemStore(addr, value));
+        }
         fn br(&mut self, target: usize) {
             self.blocks[self.cur].1 = Term::Br(target);
         }
@@ -1037,7 +1185,7 @@ mod tests {
 
     impl Interp {
         /// Runs the program over `lanes` lanes; `io` in, `res` out. Ballots wait for every lane.
-        fn run(&self, lanes: usize, io: &[u32], res: &mut [u32]) {
+        fn run(&self, lanes: usize, io: &[u32], res: &mut [u32], mem: &mut [u32]) {
             let mut ls: Vec<LaneState> = (0..lanes).map(|_| LaneState { block: 0, at: 0, from: 0, env: HashMap::new(), done: false }).collect();
             let mut steps = 0usize;
             loop {
@@ -1103,6 +1251,14 @@ mod tests {
                                 Ins::Lane => Some(lane as u32),
                                 Ins::Ballot(..) => break,
                                 Ins::IoLoad(a) => Some(io[g(a) as usize]),
+                                Ins::MemLoad(a) => Some(mem.get((g(a) / 4) as usize).copied().unwrap_or(0)),
+                                Ins::MemStore(a, v) => {
+                                    let (a, v) = (g(a), g(v));
+                                    if let Some(w) = mem.get_mut((a / 4) as usize) {
+                                        *w = v;
+                                    }
+                                    None
+                                }
                                 Ins::ResStore(a, v) => {
                                     res[g(a) as usize] = g(v);
                                     None
@@ -1195,6 +1351,25 @@ mod tests {
         ENDPGM,
     ];
 
+    /// v1 = 4·lane; s[4:5] = mem[2..4]; v2 = mem[lane] + s4; then lanes below 16 store v2 at
+    /// mem[64 + lane] (a guarded store: no skip branch), and every lane stores v0 at mem[128 + lane]
+    const MEMORY: &[I] = &[
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 130), ("VSRC1", 0)]),
+        ("S_LOAD_DWORDX2", "ENC_SMEM", &[("SDATA", 4), ("SBASE", 0), ("OFFSET", 8), ("SOFFSET", 125)]),
+        ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 2), ("ADDR", 1), ("SADDR", 125), ("OFFSET", 0)]),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 4), ("VSRC1", 2)]),
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)]),
+        ("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 6), ("SSRC0", 106)]),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 1), ("DATA", 2), ("SADDR", 125), ("OFFSET", 0x100)]),
+        ("S_OR_B32", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 6)]),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 1), ("DATA", 0), ("SADDR", 125), ("OFFSET", 0x200)]),
+        ENDPGM,
+    ];
+
+    fn memory_image() -> Vec<u32> {
+        (0..256).map(|i| 1000 + i).collect()
+    }
+
     fn decode(lines: &[I]) -> Vec<Decoded> {
         let bytes: Vec<u8> = lines.iter().flat_map(|(n, e, f)| rdna2::encode(n, e, f, None).unwrap()).collect();
         let mut out = Vec::new();
@@ -1209,6 +1384,12 @@ mod tests {
 
     /// The kernel run on the CPU: initial (sgpr, vgpr[lane]) → final ones.
     fn run(lines: &[I], wave64: bool, sgpr: &[u32], vgpr: &[Vec<u32>]) -> (Vec<u32>, Vec<Vec<u32>>) {
+        let (s, v, _) = run_mem(lines, wave64, sgpr, vgpr, &[]);
+        (s, v)
+    }
+
+    /// … with the flat memory too: (sgpr, vgpr[lane], memory after).
+    fn run_mem(lines: &[I], wave64: bool, sgpr: &[u32], vgpr: &[Vec<u32>], mem: &[u32]) -> (Vec<u32>, Vec<Vec<u32>>, Vec<u32>) {
         let insts = decode(lines);
         let (ir, _) = lower_kernel(&insts, wave64, Interp::default()).unwrap_or_else(|e| panic!("{e}"));
         let lanes = if wave64 { 64 } else { 32 };
@@ -1218,9 +1399,10 @@ mod tests {
             io[KERNEL_SGPRS + l * KERNEL_VGPRS..][..regs.len()].copy_from_slice(regs);
         }
         let mut res = io.clone();
-        ir.run(lanes, &io, &mut res);
+        let mut mem = mem.to_vec();
+        ir.run(lanes, &io, &mut res, &mut mem);
         let v = (0..lanes).map(|l| res[KERNEL_SGPRS + l * KERNEL_VGPRS..][..KERNEL_VGPRS].to_vec()).collect();
-        (res[..KERNEL_SGPRS].to_vec(), v)
+        (res[..KERNEL_SGPRS].to_vec(), v, mem)
     }
 
     fn state(lanes: usize) -> (Vec<u32>, Vec<Vec<u32>>) {
@@ -1298,7 +1480,7 @@ mod tests {
             runner::skip_test(if runner::adapter().is_err() { "no GPU" } else { "no DXC" });
             return;
         }
-        for (name, lines) in [("straight", STRAIGHT), ("skipped if", SKIPPED_IF), ("leaving loop", LEAVING_LOOP), ("uniform loop", UNIFORM_LOOP)] {
+        for (name, lines) in [("straight", STRAIGHT), ("skipped if", SKIPPED_IF), ("leaving loop", LEAVING_LOOP), ("uniform loop", UNIFORM_LOOP), ("memory", MEMORY)] {
             let bytes: Vec<u8> = lines.iter().flat_map(|(n, e, f)| rdna2::encode(n, e, f, None).unwrap()).collect();
             let (s, v) = state(32);
             let mut st = runner::KernelState::default();
@@ -1309,8 +1491,10 @@ mod tests {
             let t = translate(&bytes, &Options { wave64: false, ..Default::default() }).unwrap();
             assert!(t.complete(), "{name}: {:?}", t.unsupported_why);
             let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
-            let gpu = runner::run(&dxil, &st, &[]).unwrap();
-            let (cs, cv) = run(lines, false, &s, &v);
+            let mem = memory_image();
+            let gpu = runner::run(&dxil, &st, &mem).unwrap();
+            let (cs, cv, cmem) = run_mem(lines, false, &s, &v, &mem);
+            assert_eq!(&gpu.mem[..cmem.len()], &cmem[..], "{name}: memory");
             let insts = decode(lines);
             // masks some lanes kept their own older bits of (`lower_kernel`'s `stale`): only the
             // kernel ABI's final store sees them
@@ -1332,6 +1516,22 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn scalar_and_vector_memory_with_a_guarded_store() {
+        let (s, v) = state(32);
+        let (s, v, mem) = run_mem(MEMORY, false, &s, &v, &memory_image());
+        assert_eq!((s[4], s[5]), (1002, 1003));
+        for l in 0..32 {
+            assert_eq!(v[l][2], 2002 + l as u32, "lane {l}");
+            assert_eq!(mem[64 + l], if l < 16 { 2002 + l as u32 } else { 1064 + l as u32 }, "guarded store, lane {l}");
+            assert_eq!(mem[128 + l], l as u32, "store, lane {l}");
+        }
+        // the store under the narrowed EXEC is the guarded one
+        let insts = decode(MEMORY);
+        let sum = lane_masks::analyze(&insts, false).unwrap();
+        assert_eq!(sum.guarded.iter().filter(|&&pc| insts.iter().any(|d| d.pc == pc && is_store(d))).count(), 1);
     }
 
     #[test]
