@@ -923,6 +923,7 @@ impl Lw {
                         let a = f64v(self, 0);
                         let t = self.s.m.f32();
                         let f = self.s.m.cast(CastOp::FPTrunc, a, t);
+                        let f = self.rm_cvt_f64(a, f);
                         let f = match m.omod {
                             1..=3 => {
                                 let k = self.fc([2.0, 4.0, 0.5][m.omod as usize - 1]);

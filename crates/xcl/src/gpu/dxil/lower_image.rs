@@ -456,8 +456,23 @@ impl Lw {
             3 => TexKind::CubeArray,
             4 => TexKind::D1Array,
             5 => TexKind::D2Array,
+            // multisampled: the fragment index is the sample index (D3D12 MSAA resources have
+            // no FMASK; their samples are stored uncompressed)
+            6 => TexKind::D2MS,
+            7 => TexKind::D2MSArray,
             _ => return err(d, "MIMG dim"),
         };
+        let ms = matches!(dim, 6 | 7);
+        if ms && (sampling || base == "get_lod") {
+            return err(d, "MIMG sample MSAA");
+        }
+        if ms && !matches!(base, "load" | "msaa_load" | "get_resinfo") {
+            // stores / atomics need RWTexture2DMS (SM 6.7, WriteableMSAATextures)
+            return err(d, "MIMG MSAA store / atomic / load_mip");
+        }
+        if base == "msaa_load" && !ms {
+            return err(d, "image_msaa_load on a single-sampled dim");
+        }
 
         if sampling {
             if f("UNORM") != 0 && dim != 3 {
@@ -645,6 +660,19 @@ impl Lw {
             return self.image_result(vdata, &vals, d16, act);
         }
 
+        if base == "get_resinfo" && ms {
+            // one level; the sample count is a T# field (LAST_LEVEL), read by the program itself
+            let tex = self.s.heap_texture(tw0, kind, false, CompType::F32, 4, true);
+            let dims = self.s.get_dimensions(tex.handle, None);
+            let one = self.c(1);
+            let w = self.s.m.extract(dims, 0);
+            let hh = self.s.m.extract(dims, 1);
+            let dd = if dim == 7 { self.s.m.extract(dims, 2) } else { one };
+            let r = [w, hh, dd, one];
+            let vals: Vec<Value> = comps.iter().map(|&c| r[c as usize]).collect();
+            return self.image_result(vdata, &vals, false, act);
+        }
+
         if base == "get_resinfo" {
             let mipv = compu(self, 0);
             let tex = self.s.heap_texture(tw0, kind, false, CompType::F32, 4, true);
@@ -681,6 +709,9 @@ impl Lw {
         let fmt = self.lshrc(tw1, 20);
         let fmt = self.andc(fmt, 0x1FF);
         let cls = self.img_cls(fmt);
+        if ms {
+            return self.mimg_msaa(base, &ic, tw0, lkind, cls, &comps, vdata, d16, act);
+        }
         match base {
             "load" | "load_mip" => {
                 let tmps = [self.tmp_var(), self.tmp_var(), self.tmp_var(), self.tmp_var()];
@@ -796,6 +827,68 @@ impl Lw {
             }
             _ => err(d, "MIMG"),
         }
+    }
+
+    /// `image_load` / `image_msaa_load` on a multisampled T#: `ic` = x, y, (slice,) fragment.
+    /// `image_load` reads the DMASK components of that sample; `image_msaa_load` reads the one
+    /// DMASK component of the four samples fragment .. fragment + 3 (a gather of samples).
+    /// Samples past the resource's count read 0 (made explicit: D3D leaves them undefined).
+    #[allow(clippy::too_many_arguments)]
+    fn mimg_msaa(&mut self, base: &str, ic: &[Value], tw0: Value, kind: TexKind, cls: Value, comps: &[u64], vdata: u64, d16: bool, act: Value) -> LResult<()> {
+        let nc = kind.coords();
+        let frag = ic[nc];
+        let coords = ic[..nc].to_vec();
+        let samples: Vec<Value> = if base == "msaa_load" { (0..4).map(|k| self.addc(frag, k)).collect() } else { vec![frag] };
+        // per sample: the texel's four channels as raw bits
+        let tmps: Vec<[u32; 4]> = samples.iter().map(|_| [self.tmp_var(), self.tmp_var(), self.tmp_var(), self.tmp_var()]).collect();
+        let z = self.c(0);
+        for t in &tmps {
+            for &v in t {
+                self.wr(v, z);
+            }
+        }
+        for (cv, ct) in [(1u32, CompType::U32), (2, CompType::I32), (0, CompType::F32)] {
+            let is = self.cmpc(Pred::Eq, cls, cv);
+            let samples = samples.clone();
+            let coords = coords.clone();
+            let tmps = tmps.clone();
+            self.guarded(is, &mut |lw| {
+                let tex: Texture = lw.s.heap_texture(tw0, kind, false, ct, 4, true);
+                let dims = lw.s.get_dimensions(tex.handle, None);
+                let count = lw.s.m.extract(dims, 3);
+                for (si, &sv) in samples.iter().enumerate() {
+                    let r = lw.s.texture_load_sample(tex, sv, &coords);
+                    let inside = lw.cmp(Pred::ULt, sv, count);
+                    for k in 0..4 {
+                        let b = lw.bits(r[k]);
+                        let zz = lw.c(0);
+                        let b = lw.sel(inside, b, zz);
+                        lw.wr(tmps[si][k], b);
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        let raw: Vec<Value> = if base == "msaa_load" {
+            let c = comps.first().copied().unwrap_or(0) as usize;
+            tmps.iter().map(|t| self.rd(t[c])).collect()
+        } else {
+            comps.iter().map(|&c| self.rd(tmps[0][c as usize])).collect()
+        };
+        let vals: Vec<Value> = if d16 {
+            raw.iter()
+                .map(|&x| {
+                    let fx = self.f(x);
+                    let h = self.s.f32_to_f16(fx);
+                    let lo = self.andc(x, 0xFFFF);
+                    let fl = self.cmpc(Pred::Eq, cls, 0);
+                    self.sel(fl, h, lo)
+                })
+                .collect()
+        } else {
+            raw
+        };
+        self.image_result(vdata, &vals, d16, act)
     }
 
     /// A compare-exchange loop on a texel (`rmw32` on an `At::Ref` texel).

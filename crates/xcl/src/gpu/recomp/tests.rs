@@ -3946,11 +3946,24 @@ fn gpu_geometry_wave32_prefix_count_over_a_mask() {
     assert!(windowed.hlsl.contains("RWByteAddressBuffer mem3 : register(u5)"));
     super::dxc::compile(&windowed.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
     // the native wave64 form keeps the program, and computes the reference where it can run
-    let native = translate_geometry(&code, g, false, 1).unwrap();
+    let native = translate_geometry(&code, g.clone(), false, 1).unwrap();
     if runner::wave64_supported() == Ok(true) {
         run(&native);
     } else {
         runner::skip_test("no wave64");
+    }
+    // the direct DXIL translator's compute pass computes the same, split and native
+    let direct = |split: bool| {
+        let o = crate::gpu::dxil::kernel::KernelOptions { wave64: true, split, mem_windows: 1, sampler_base: 0 };
+        let cs = crate::gpu::dxil::kernel::translate_geometry(&code, o, &g).unwrap_or_else(|e| panic!("{}", &e[..e.len().min(2000)])).dxil;
+        let mem = runner::dispatch(&cs, [1, 1, 1], &io, &vec![0u32; 0x400 / 4 + 3 * 64]).unwrap();
+        let got: Vec<[u32; 3]> = (0..64).map(|l| [0, 1, 2].map(|k| mem[0x100 + 64 * k + l])).collect();
+        let wrong: Vec<_> = (0..64).filter(|&l| got[l] != want[l]).map(|l| (l, got[l], want[l])).collect();
+        assert!(wrong.is_empty(), "direct split {split} (got [vcc, s[10:11], exec], want): {wrong:?}");
+    };
+    direct(true);
+    if runner::wave64_supported() == Ok(true) {
+        direct(false);
     }
 }
 

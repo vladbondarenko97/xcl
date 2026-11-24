@@ -280,6 +280,60 @@ fn graphics_stages_with_a_branch_before_their_exports() {
     assert_eq!(draw(&dvs, &dps, 1), kept, "branch taken");
 }
 
+/// Geometry mode (ES+GS, the compute pass of `recomp::Mode::Geometry`): an ES that writes
+/// its vertex to the LDS ring, the GS that reads its triangle's vertices, writes them to
+/// its output area and emits a strip; split and native forms validate (also the ES or GS
+/// alone, as the coverage sweep translates them).
+#[test]
+fn geometry_mode_validates() {
+    use crate::gpu::recomp::GsInterface;
+    let e = |n: &str, enc: &str, f: &[(&str, u64)]| encode(n, enc, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    let mut es = Vec::new();
+    // v20 = lane * ES item (16 B), ring[v20] = v9 (a fetched input)
+    es.extend(e("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 20), ("SRC0", 193), ("SRC1", 128)]));
+    es.extend(e("V_MBCNT_HI_U32_B32", "ENC_VOP3", &[("VDST", 20), ("SRC0", 193), ("SRC1", 256 + 20)]));
+    es.extend(e("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 20), ("SRC0", 132), ("VSRC1", 20)]));
+    es.extend(e("DS_WRITE_B32", "ENC_DS", &[("ADDR", 20), ("DATA0", 9)]));
+    es.extend(e("S_BARRIER", "ENC_SOPP", &[]));
+    es.extend(e("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 6)]));
+    let mut gs = Vec::new();
+    // v0 = vertex 0's dword offset: read it, write 3 output vertices at s2 + lane * 48
+    gs.extend(e("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 30), ("SRC0", 130), ("VSRC1", 0)]));
+    gs.extend(e("DS_READ_B32", "ENC_DS", &[("ADDR", 30), ("VDST", 31)]));
+    gs.extend(e("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 32), ("SRC0", 193), ("SRC1", 128)]));
+    gs.extend(e("V_MUL_U32_U24", "ENC_VOP2", &[("VDST", 32), ("SRC0", 176), ("VSRC1", 32)]));
+    gs.extend(e("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 32), ("SRC0", 2), ("VSRC1", 32)]));
+    for k in 0..3u64 {
+        gs.extend(e("DS_WRITE_B32", "ENC_DS", &[("ADDR", 32), ("DATA0", 31), ("OFFSET0", 16 * k)]));
+        gs.extend(e("S_SENDMSG", "ENC_SOPP", &[("SIMM16", 0x22)]));
+    }
+    gs.extend(e("S_SENDMSG", "ENC_SOPP", &[("SIMM16", 0x12)]));
+    gs.extend(e("S_ENDPGM", "ENC_SOPP", &[]));
+    let sig = |name: &str, sv: u32, reg: u32| crate::gpu::dxbc::SigElement { name: name.into(), index: 0, system_value: sv, component_type: 3, register: reg, mask: 0xF, rw_mask: 0xF, stream: 0 };
+    let g = GsInterface {
+        es_inputs: vec![sig("POSITION", 0, 0)],
+        es_outputs: vec![sig("SV_Position", 1, 0)],
+        outputs: vec![sig("SV_Position", 1, 0)],
+        max_vertex_count: 3,
+        gs_start: Some(es.len() as u64),
+    };
+    let mut code = es.clone();
+    code.extend_from_slice(&gs);
+    let mut es_end = es;
+    es_end.extend(e("S_ENDPGM", "ENC_SOPP", &[]));
+    let cases = [
+        ("ES+GS", code, g.clone()),
+        ("ES alone", es_end, GsInterface { gs_start: None, ..g.clone() }),
+        ("GS alone", gs, GsInterface { gs_start: Some(0), ..g }),
+    ];
+    for (name, code, g) in cases {
+        for split in [true, false] {
+            let o = KernelOptions { wave64: true, split, mem_windows: 1, sampler_base: 0 };
+            super::kernel::translate_geometry(&code, o, &g).unwrap_or_else(|e| panic!("{name} split {split}: {}", &e[..e.len().min(3000)]));
+        }
+    }
+}
+
 /// Exhaustive bit-exact check of the IEEE-754 bit-manipulation formula used by
 /// `lower_mem::uf_small_bits` for all 10-bit (mb=5) and 11-bit (mb=6) float inputs.
 #[test]

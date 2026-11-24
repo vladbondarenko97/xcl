@@ -254,7 +254,7 @@ pub fn translate_mode(code: &[u8], mode: &Mode, o: KernelOptions, validate: bool
         Mode::Vertex(vs) => kernel::translate_vertex(code, KernelOptions { split: false, ..o }, vs),
         Mode::Pixel(ps) => kernel::translate_pixel(code, KernelOptions { split: false, ..o }, ps),
         Mode::Mesh(ms) => kernel::translate_mesh(code, o, ms),
-        Mode::Geometry(_) => Err("geometry mode (ES+GS): not supported by the direct translator".into()),
+        Mode::Geometry(g) => kernel::translate_geometry(code, o, g),
     }));
     let k = match r {
         Ok(r) => r?,
@@ -409,8 +409,7 @@ mod tests {
             r.add(name, &Sample { stage: stage_name(&mode), result: res, time: t0.elapsed(), hlsl_size: None });
         }
         assert_eq!(r.stages["kernel"].translated, 1, "{}", r.text(5));
-        assert_eq!(r.stages["GS"].unsupported, 1);
-        assert!(r.ranked()[0].0.starts_with("geometry mode"));
+        assert_eq!(r.stages["GS"].translated, 1, "{}", r.text(5));
     }
 
     #[test]

@@ -79,6 +79,9 @@ impl Init {
         if var == VAR_BUDGET {
             return s.m.i32c(LOOP_BUDGET);
         }
+        if var == super::lower_round::VAR_F32_MODE {
+            return s.m.i32c(super::lower_round::MODE_INIT);
+        }
         if var == VAR_FP16_RM || var == VAR_WIN || var == VAR_XK || var == VAR_XDEAD {
             return s.m.i32c(0);
         }
@@ -167,6 +170,9 @@ pub struct Lw {
     /// the program writes a non-default MODE[3:2] and has f16 rounding ops (no f64 ones):
     /// f16 results round in software under `VAR_FP16_RM` (the recompiler's `dynamic_f16_rm`)
     pub dyn_rm: bool,
+    /// the program writes a non-default MODE[1:0]: rounding f32 instructions round by
+    /// `lower_round::VAR_F32_MODE` (`lower_round`)
+    pub f32_rm: bool,
     pub has_f64_round_op: bool,
     /// static samplers bound so far: (S#, comparison, handle) at `s<i>, space1`
     pub static_used: Vec<([u32; 4], bool, super::ops::Sampler)>,
@@ -194,6 +200,8 @@ pub struct Lw {
     pub partner: Partner,
     /// mesh mode: the record slots
     pub mesh: Option<MeshCtx>,
+    /// geometry mode (ES+GS)
+    pub geom: Option<super::lower_geom::GeomCtx>,
     /// VS / PS entry
     pub gfx: Option<super::lower_gfx::GfxCtx>,
     /// a wave32 program in 64-lane hardware: this hardware half is the upper one (i1)
@@ -898,6 +906,12 @@ impl Lw {
         if name == "s_sendmsg" && self.mesh.is_some() {
             return self.mesh_sendmsg(d);
         }
+        if self.geom.is_some() && self.geom_inst(d, &name).is_some() {
+            return Ok(());
+        }
+        if name == "s_denorm_mode" && self.f32_rm {
+            return self.denorm_mode(Self::fv(d, "SIMM16") as u32);
+        }
         if NOOPS.contains(&name.as_str()) {
             return Ok(());
         }
@@ -961,7 +975,10 @@ impl Lw {
             "s_round_mode" => {
                 let simm = Self::fv(d, "SIMM16") as u16;
                 let (sp, dp) = ((simm & 3) as u32, ((simm >> 2) & 3) as u32);
-                if sp != 0 {
+                if self.f32_rm {
+                    let v = self.c(sp);
+                    self.mode_write(v, 3);
+                } else if sp != 0 {
                     return err(d, "non-default f32 round mode");
                 }
                 if dp != 0 && self.has_f64_round_op {
@@ -983,6 +1000,22 @@ impl Lw {
     fn setreg(&mut self, d: &Decoded, name: &str) -> LResult<()> {
         let simm = Self::fv(d, "SIMM16") as u16;
         let (sp_mask, dp_mask, off) = hwreg_mode_round_masks(simm);
+        if self.f32_rm {
+            // the mirrored MODE bits (single-precision round / denormal modes)
+            let (id, offset, width) = decode_hwreg(simm);
+            if id == 1 {
+                let wmask = if width >= 32 { u32::MAX } else { ((1u32 << width) - 1) << offset };
+                let src = if name == "s_setreg_imm32_b32" {
+                    let imm = d.literal.ok_or_else(|| format!("{}: literal", rdna2::format(d)))?;
+                    self.c(imm)
+                } else {
+                    let sd = Self::field(d, "SDST");
+                    self.code32(sd, None, false).ok_or_else(|| format!("{}: register", rdna2::format(d)))?
+                };
+                let v = self.shlc(src, offset);
+                self.mode_write(v, wmask);
+            }
+        }
         if sp_mask == 0 && dp_mask == 0 {
             return Ok(());
         }
@@ -990,7 +1023,7 @@ impl Lw {
             let imm = d.literal.ok_or_else(|| format!("{}: literal", rdna2::format(d)))?;
             let sp = hwreg_imm_field(imm, off, 0, sp_mask);
             let dp = hwreg_imm_field(imm, off, 2, dp_mask);
-            if sp != 0 {
+            if sp != 0 && !self.f32_rm {
                 return err(d, "non-default f32 round mode");
             }
             if dp_mask != 0 && dp != 0 && self.has_f64_round_op {
@@ -1008,7 +1041,7 @@ impl Lw {
             }
             return Ok(());
         }
-        if sp_mask != 0 {
+        if sp_mask != 0 && !self.f32_rm {
             return err(d, "dynamic f32 round mode");
         }
         if self.has_f64_round_op {

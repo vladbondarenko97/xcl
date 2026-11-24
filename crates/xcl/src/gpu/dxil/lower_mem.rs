@@ -1880,6 +1880,7 @@ impl Lw {
         self.s.gs_load(g, i)
     }
     fn lds_st(&mut self, at: Value, v: Value) {
+        self.geom_note_store(at);
         let i = self.lds_index(at);
         let g = self.lds.expect("lds");
         self.s.gs_store(g, i, v);

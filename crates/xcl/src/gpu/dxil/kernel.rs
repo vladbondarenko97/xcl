@@ -18,7 +18,7 @@ use super::module::{Block, Pred, Value};
 use super::shader::{RawUav, Shader};
 use super::ssa::Ssa;
 use crate::gpu::rdna2::Decoded;
-use crate::gpu::recomp::{CsInterface, MsInterface, PsInterface, VsInterface, KERNEL_SCC_SLOT, KERNEL_SGPRS, KERNEL_VGPRS, MESH_HEADER};
+use crate::gpu::recomp::{CsInterface, GsInterface, MsInterface, PsInterface, VsInterface, KERNEL_SCC_SLOT, KERNEL_SGPRS, KERNEL_VGPRS, MESH_HEADER};
 
 #[derive(Debug, Clone, Copy)]
 pub struct KernelOptions {
@@ -37,7 +37,7 @@ pub struct KernelOptions {
 /// Version of the direct translator's output, part of the on-disk translation cache's
 /// identity (`recomp::pso`): bump it on any change that alters the emitted containers
 /// (the `gpu/dxil` sources are not in build.rs's translator source hash).
-pub const TRANSLATOR_VERSION: u32 = 6;
+pub const TRANSLATOR_VERSION: u32 = 7;
 
 /// `XCL_DIRECT_DXIL=1`: console compute shaders (and the kernel tests) go through this
 /// translator, with the HLSL path as the fallback for what it cannot translate yet.
@@ -86,6 +86,12 @@ pub fn translate_pixel(code: &[u8], o: KernelOptions, ps: &PsInterface) -> Resul
     translate_entry(code, o, Entry::Pixel(ps.clone()))
 }
 
+/// A geometry-mode (ES+GS) program: the compute pass that writes one mesh record per
+/// group of 21 triangles into `res` (the recompiler's `Mode::Geometry`). Always wave64.
+pub fn translate_geometry(code: &[u8], o: KernelOptions, g: &GsInterface) -> Result<Kernel, String> {
+    translate_entry(code, KernelOptions { wave64: true, ..o }, Entry::Geometry(g.clone()))
+}
+
 /// The entry ABI.
 #[derive(Clone)]
 pub enum Entry {
@@ -94,6 +100,7 @@ pub enum Entry {
     Mesh(MsInterface),
     Vertex(VsInterface),
     Pixel(PsInterface),
+    Geometry(GsInterface),
 }
 
 /// A compute-mode program (the CS ABI of `cs`).
@@ -132,7 +139,14 @@ fn mem_windows(s: &mut Shader, mem_windows: u32, coherent: bool) -> (Vec<RawUav>
 }
 
 fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry) -> Result<Kernel, String> {
-    let cfg = Cfg::build(code)?;
+    let geo = match &entry {
+        Entry::Geometry(g) => Some(g.clone()),
+        _ => None,
+    };
+    let cfg = match &geo {
+        Some(g) => Cfg::build_geometry(code, g.gs_start)?,
+        None => Cfg::build(code)?,
+    };
     let kernel = matches!(entry, Entry::Kernel);
     let gfx = matches!(entry, Entry::Vertex(_) | Entry::Pixel(_));
     let split = o.wave64 && o.split && !gfx;
@@ -161,6 +175,15 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry) -> Resu
             mesh_init(&mut lw, ms, tid, io);
             [ms.threads, 1, 1]
         }
+        Entry::Geometry(g) => {
+            let (tid, _) = lw.setup_lanes_compute([64, 1, 1], uses_lds);
+            let used: BTreeSet<u64> = cfg.insts.iter().flat_map(|d| {
+                let (r, w) = crate::gpu::rdna2::vgpr_uses(d);
+                r.into_iter().chain(w)
+            }).collect();
+            geom_init(&mut lw, g, tid, io, &used);
+            [64, 1, 1]
+        }
         Entry::Vertex(vs) => {
             lw.setup_lanes_gfx();
             let used: BTreeSet<u64> = cfg.insts.iter().flat_map(|d| {
@@ -181,6 +204,7 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry) -> Resu
     // them in a program with branches, those up to the first s_endpgm in straight-line code
     let branchy = cfg.insts.iter().any(|d| crate::gpu::rdna2::branch_target(d).is_some());
     (lw.dyn_rm, lw.has_f64_round_op) = super::lower::round_modes(&cfg.insts, !branchy);
+    lw.f32_rm = super::lower_round::f32_round_writes(&cfg.insts);
     for d in cfg.insts.iter().filter(|_| kernel) {
         if !branchy && d.inst.name.starts_with("S_ENDPGM") {
             break;
@@ -198,6 +222,16 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry) -> Resu
     let n = cfg.blocks.len();
     let mut heads: Vec<Option<Block>> = vec![None; n];
     let entry = *cfg.rpo.first().ok_or("empty program")?;
+    // split geometry mode: the GS's first block is entered from the phase switch (one edge)
+    // instead of from the ES blocks that jump there
+    if let (Some(g), true) = (&geo, split) {
+        let gs_block = (0..n).find(|&b| g.gs_start.is_some_and(|s| s > 0 && cfg.blocks[b].pc == s));
+        if let Some(t) = gs_block {
+            let gs_preds = cfg.blocks[t].preds.iter().filter(|&&p| cfg.blocks[p].pc >= g.gs_start.unwrap_or(0)).count();
+            let es = cfg.blocks[t].preds.len() > gs_preds;
+            heads[t] = Some(lw.block(Some(gs_preds + es as usize)));
+        }
+    }
     let mut head = |lw: &mut Lw, b: usize| -> Block {
         if let Some(h) = heads[b] {
             return h;
@@ -207,18 +241,51 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry) -> Resu
         heads[b] = Some(h);
         h
     };
+    // geometry mode: which blocks are GS code; the split form runs the ES in both hardware
+    // waves, then (`switch`: a group barrier) the GS in the lower one with fresh registers
+    let gs_start = geo.as_ref().and_then(|g| g.gs_start);
+    let in_gs = |b: usize| gs_start.is_some_and(|s| cfg.blocks[b].pc >= s);
+    let two_phase = split && gs_start.is_some_and(|s| s > 0);
+    let gs_only = split && gs_start == Some(0);
+    let es_xn = lw.xn;
+    if gs_only {
+        lw.partner = Partner::Missing;
+        lw.xn = lw.c(0);
+    }
     let h0 = head(&mut lw, entry);
-    lw.edge(Block(0), h0);
     let exit = lw.block(None);
+    if gs_only {
+        // the GS alone: in the lower hardware wave only
+        let gate = lw.block(Some(1));
+        lw.edge(Block(0), gate);
+        lw.s.m.set_block(gate);
+        let up = lw.upper;
+        lw.cond_br(up, exit, h0);
+    } else {
+        lw.edge(Block(0), h0);
+    }
+    let switch = if two_phase { Some(lw.block(None)) } else { None };
+    let mut gs_entry: Option<usize> = None;
     for &b in &cfg.rpo {
         let h = head(&mut lw, b);
         lw.s.m.set_block(h);
+        let es_block = two_phase && !in_gs(b);
+        if two_phase {
+            if in_gs(b) {
+                lw.partner = Partner::Missing;
+                lw.xn = lw.c(0);
+            } else {
+                lw.partner = Partner::Present;
+                lw.xn = es_xn;
+            }
+        }
+        let end = if es_block { switch.unwrap() } else { exit };
         if cfg.headers.contains(&b) {
             // a lane's loop iterations are capped (the recompiler's LOOP_GUARD)
             let left = lw.rd(VAR_BUDGET);
             let none = lw.cmpc(Pred::Eq, left, 0);
             let cont = lw.block(Some(1));
-            lw.cond_br(none, exit, cont);
+            lw.cond_br(none, end, cont);
             lw.s.m.set_block(cont);
             let one = lw.c(1);
             let l = lw.sub(left, one);
@@ -228,6 +295,11 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry) -> Resu
             lw.inst(&cfg.insts[i])?;
         }
         match cfg.blocks[b].term {
+            Term::Jump(t) if es_block && in_gs(t) => {
+                // the ES's s_setpc_b64 into the GS: through the phase switch
+                gs_entry = Some(t);
+                lw.br(end);
+            }
             Term::Jump(t) => {
                 let t = head(&mut lw, t);
                 lw.br(t);
@@ -237,7 +309,27 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry) -> Resu
                 let (t, f) = (head(&mut lw, t), head(&mut lw, f));
                 lw.cond_br(c, t, f);
             }
-            Term::End => lw.br(exit),
+            Term::End => lw.br(end),
+        }
+    }
+    if let Some(sw) = switch {
+        lw.s.m.set_block(sw);
+        lw.seal(sw);
+        lw.partner = Partner::Present;
+        lw.xn = es_xn;
+        lw.s.barrier(super::ops::barrier::GROUP_SYNC);
+        match gs_entry {
+            Some(t) => {
+                let gs = lw.block(Some(1));
+                let up = lw.upper;
+                lw.cond_br(up, exit, gs);
+                lw.s.m.set_block(gs);
+                let vars: Vec<u32> = lw.init.touched.iter().copied().filter(|&v| v < VAR_BUDGET && v != VAR_SCC && v != 126 && v != 127).collect();
+                lw.geom_gs_phase_registers(&vars);
+                let h = head(&mut lw, t);
+                lw.br(h);
+            }
+            None => lw.br(exit),
         }
     }
     lw.s.m.set_block(exit);
@@ -252,6 +344,21 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry) -> Resu
     }
     if gfx {
         lw.finish_gfx();
+    }
+    if geo.is_some() {
+        if split {
+            // the record comes from the lower hardware wave (the GS phase's)
+            let epi = lw.block(Some(1));
+            let done = lw.block(Some(2));
+            let up = lw.upper;
+            lw.cond_br(up, done, epi);
+            lw.s.m.set_block(epi);
+            lw.geom_epilogue();
+            lw.br(done);
+            lw.s.m.set_block(done);
+        } else {
+            lw.geom_epilogue();
+        }
     }
     lw.s.m.ret();
     lw.s.m.set_block(Block(0));
@@ -288,7 +395,7 @@ impl Lw {
         };
         let mut s = Shader::new(stage, (6, 6));
         let io = s.raw_uav(0, 0);
-        let res = if kernel || ms.is_some() { Some(s.raw_uav(1, 0)) } else { None };
+        let res = if kernel || ms.is_some() || matches!(entry, Entry::Geometry(_)) { Some(s.raw_uav(1, 0)) } else { None };
         let (mems, heap_mem) = mem_windows(&mut s, o.mem_windows, cs.is_some());
         let i32 = s.m.i32();
         let z = s.m.i32c(0);
@@ -315,6 +422,7 @@ impl Lw {
             static_used: Vec::new(),
             sampler_base: o.sampler_base,
             dyn_rm: false,
+            f32_rm: false,
             has_f64_round_op: false,
             exec_cache: HashMap::new(),
             xs: None,
@@ -329,6 +437,7 @@ impl Lw {
             dpp_enable: None,
             partner: Partner::Present,
             mesh: None,
+            geom: None,
             gfx: None,
             gfx_half: None,
             whole_live: Default::default(),
@@ -343,7 +452,8 @@ impl Lw {
         }
         // LDS and the split form's exchange slot size (16 words for a coherent s_load_dwordx16,
         // 32 for ds_bpermute), as the HLSL kernel sizes them
-        let mut uses_lds = false;
+        // geometry mode always has the LDS (the ES ring and the GS output)
+        let mut uses_lds = matches!(entry, Entry::Geometry(_));
         let mut slot = 1u32;
         for d in insts {
             let n = d.inst.name;
@@ -370,6 +480,7 @@ impl Lw {
             Entry::Kernel => None,
             Entry::Compute(cs) => Some(cs.threads.iter().product()),
             Entry::Mesh(ms) => Some(ms.threads),
+            Entry::Geometry(_) => Some(64),
         };
         if let (Some(t), true) = (group_threads, split) {
             lw.waves = t.div_ceil(64).max(1);
@@ -558,4 +669,102 @@ fn entry_exec(lw: &mut Lw, total: u32, tid: Value) -> (Value, Value) {
         (w[0], if lw.wave64 { w[1] } else { zero })
     };
     (lo, hi)
+}
+
+/// The geometry entry's registers (the HLSL geometry mode's prologue): the group's
+/// primitives from `io`, s2 = the GS output area, s3 = ES vertices | GS primitives << 8,
+/// SCC 0, EXEC = every lane; v0 / v1 = LDS offsets of each GS lane's triangle vertices,
+/// v2 = primitive id, v5 = vertex id, the fetch shader's VGPRs from the pre-fetched
+/// vertices; and the GS state (`lower_geom`).
+fn geom_init(lw: &mut Lw, g: &GsInterface, _tid: Value, io: super::shader::RawUav, used: &BTreeSet<u64>) {
+    use crate::gpu::recomp::{fetched_registers, GS_PRIMS_PER_GROUP, IO_GS_PRIMS, IO_GS_VERTICES};
+    let pg = GS_PRIMS_PER_GROUP;
+    let rec_i = g.record();
+    let o = lw.c((IO_GS_PRIMS * 4) as u32);
+    let total = lw.s.raw_load(io, o, 1)[0];
+    let o = lw.c((IO_GS_VERTICES * 4) as u32);
+    let vin = lw.s.raw_load(io, o, 1)[0];
+    let gid = lw.s.group_id(0);
+    let kp = lw.c(pg);
+    let p0 = lw.mul(gid, kp);
+    let more = lw.cmp(Pred::UGt, total, p0);
+    let left = lw.sub(total, p0);
+    let left = lw.umin(left, kp);
+    let zero = lw.c(0);
+    let np = lw.sel(more, left, zero);
+    let k3 = lw.c(3);
+    let nv = lw.mul(np, k3);
+    let kr = lw.c(rec_i.record_dwords() as u32);
+    let rec = lw.mul(gid, kr);
+    let mut sgpr = HashMap::new();
+    let s2 = lw.c(g.es_ring_bytes());
+    sgpr.insert(2, s2);
+    let np8 = lw.shlc(np, 8);
+    let s3 = lw.or(nv, np8);
+    sgpr.insert(3, s3);
+    sgpr.insert(VAR_SCC, zero);
+    if lw.split && g.gs_start == Some(0) {
+        // the GS alone runs in the lower hardware wave only: no partner half
+        lw.partner = Partner::Missing;
+        lw.xn = zero;
+    }
+    let t = lw.b(true);
+    let (lo, hi) = lw.ballot(t);
+    sgpr.insert(126, lo);
+    sgpr.insert(127, hi);
+    let lane = lw.lane;
+    let item = g.es_item_bytes() / 4;
+    let in_np = lw.cmp(Pred::ULt, lane, np);
+    let l3 = lw.mul(lane, k3);
+    let ki = lw.c(item);
+    let a0 = lw.mul(l3, ki);
+    let l31 = lw.addc(l3, 1);
+    let a1 = lw.mul(l31, ki);
+    let a1 = lw.shlc(a1, 16);
+    let v0 = lw.or(a0, a1);
+    let v0 = lw.sel(in_np, v0, zero);
+    let l32 = lw.addc(l3, 2);
+    let v1 = lw.mul(l32, ki);
+    let v1 = lw.sel(in_np, v1, zero);
+    let v2 = lw.add(p0, lane);
+    let p03 = lw.mul(p0, k3);
+    let v5 = lw.add(p03, lane);
+    let mut vgpr = HashMap::new();
+    vgpr.insert(0, v0);
+    vgpr.insert(1, v1);
+    vgpr.insert(2, v2);
+    vgpr.insert(5, v5);
+    let nreg = g.input_registers();
+    let fetched = fetched_registers(&g.es_inputs);
+    let in_nv = lw.cmp(Pred::ULt, lane, nv);
+    let mem = lw.mems[0];
+    for &v in used.iter().filter(|&&v| (9..256).contains(&v)) {
+        let k = ((v - 9) / 4) as usize;
+        if k >= fetched.len() || fetched[k] >= nreg {
+            continue;
+        }
+        let (r, c) = (fetched[k], ((v - 9) % 4) as u32);
+        // mem.Load(vin + ((p0 * 3 + lane) * nreg + r) * 16 + 4c), 0 past the group's vertices
+        let kn = lw.c(nreg);
+        let x = lw.mul(v5, kn);
+        let x = lw.addc(x, r);
+        let x = lw.shlc(x, 4);
+        let x = lw.add(vin, x);
+        let x = lw.addc(x, 4 * c);
+        let val = lw.s.raw_load(mem, x, 1)[0];
+        let val = lw.sel(in_nv, val, zero);
+        vgpr.insert(v as u32, val);
+    }
+    lw.init.compute = Some(ComputeInit { sgpr, vgpr, zero });
+    let maxt = g.max_vertex_count.saturating_sub(2).max(1);
+    let i32 = lw.s.m.i32();
+    let arr = lw.s.m.array(maxt as u64, i32);
+    let tri = lw.s.m.alloca(arr, 4);
+    let (emitted, strip, ntri, base) = (lw.tmp_var(), lw.tmp_var(), lw.tmp_var(), lw.tmp_var());
+    for v in [emitted, strip, ntri] {
+        lw.wr(v, zero);
+    }
+    let none = lw.c(u32::MAX);
+    lw.wr(base, none);
+    lw.geom = Some(super::lower_geom::GeomCtx { g: g.clone(), emitted, strip, ntri, base, tri, maxt, rec });
 }
