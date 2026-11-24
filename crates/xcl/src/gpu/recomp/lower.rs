@@ -2341,6 +2341,133 @@ pub(crate) mod tests {
         ENDPGM,
     ];
 
+    pub(crate) fn check_f32_arithmetic(_: &[u32], v: &[Vec<u32>]) {
+        let sat = |x: f32| x.clamp(0.0, 1.0);
+        for (l, r) in v.iter().enumerate() {
+            let f = |i: usize| f32::from_bits(r[i]);
+            let (p, x) = (f(1), f(2));
+            assert_eq!((p, x), (2f32.powi(l as i32), 2f32.powi(l as i32) * (1.0 + l as f32 / 64.0)), "lane {l}");
+            let y = x + 0.5;
+            let want = [y, x - p, x + 4.0, x * x, x.min(2.0), x.max(2.0), x * -2.0 + p, x * 0.5 + y, 4.0 * x + p, -0.5 * x + y, -x * 4.0, (x + p) * 0.5, (p - x) * 2.0, (p * p - x) * 4.0, sat((x - p) * 0.5), sat(2.0 - x)];
+            for (i, w) in want.iter().enumerate() {
+                assert_eq!(f(3 + i).to_bits(), w.to_bits(), "lane {l} v{}: {} against {w}", 3 + i, f(3 + i));
+            }
+            assert_eq!((r[20], r[21], r[22]), (r[2], r[2], 0), "lane {l}: NaN into min, max, clamp");
+            assert_eq!(f(23), 0.5 * x + p, "lane {l}: VOP3 fmac");
+        }
+    }
+
+    pub(crate) fn check_f32_compares(s: &[u32], v: &[Vec<u32>]) {
+        let preds: [fn(f32, f32) -> bool; 18] = [
+            |_, _| false,
+            |a, b| a < b,
+            |a, b| a == b,
+            |a, b| a <= b,
+            |a, b| a > b,
+            |a, b| a < b || a > b,
+            |a, b| a >= b,
+            |a, b| !a.is_nan() && !b.is_nan(),
+            |a, b| a.is_nan() || b.is_nan(),
+            |a, b| !(a >= b),
+            |a, b| !(a < b || a > b),
+            |a, b| !(a > b),
+            |a, b| !(a <= b),
+            |a, b| !(a == b),
+            |a, b| !(a < b),
+            |_, _| true,
+            |a, _| -a.abs() == -4.0,
+            |a, _| !(2.0 > -a),
+        ];
+        let a: Vec<f32> = (0..32).map(|l| if l % 4 == 0 { f32::from_bits(0x7FFF_FFFF) } else { 2f32.powi(l) }).collect();
+        let mask = |p: &dyn Fn(f32) -> bool| (0..32).filter(|&l| p(a[l])).fold(0u32, |m, l| m | 1 << l);
+        for (k, p) in preds.iter().enumerate() {
+            assert_eq!(s[2 * k], mask(&|x| p(x, 4.0)), "s{}", 2 * k);
+        }
+        assert_eq!(s[106], mask(&|x| x < 4.0), "vcc");
+        assert_eq!(s[126], mask(&|x| x >= 4.0), "exec");
+        for (l, r) in v.iter().enumerate() {
+            assert_eq!(r[3], a[l].to_bits(), "lane {l}");
+            assert_eq!(r[6], if a[l] < 4.0 { r[1] } else { 0 }, "lane {l}: cndmask");
+            assert_eq!(r[7], if a[l] >= 4.0 { 1f32.to_bits() } else { 0 }, "lane {l}: under v_cmpx");
+        }
+    }
+
+    pub(crate) fn check_f32_conversions(_: &[u32], v: &[Vec<u32>]) {
+        for (l, r) in v.iter().enumerate() {
+            let f = |i: usize| f32::from_bits(r[i]);
+            let (li, q) = (l as i32 - 16, (l as i32 - 16) as f32 / 4.0);
+            assert_eq!(f(2), li as f32, "lane {l}");
+            assert_eq!(f(4), ((l as u32) << 26 | l as u32) as f32, "lane {l}: u32 rounded to nearest even");
+            assert_eq!(f(5), (li as f32 * 0.5).clamp(0.0, 1.0), "lane {l}: omod and clamp");
+            assert_eq!(f(6), q, "lane {l}");
+            // the HLSL path's cvt_i32 / cvt_u32 saturate as Rust's `as` does, NaN giving 0
+            assert_eq!((r[7], r[8]), (q as i32 as u32, q as u32), "lane {l}: truncated");
+            assert_eq!((r[9], r[10]), ((q + 0.5).floor() as i32 as u32, q.floor() as i32 as u32), "lane {l}: rpi, flr");
+            assert_eq!((r[12], r[13], r[14]), (f(11) as i32 as u32, f(11) as u32, (-f(11)) as i32 as u32), "lane {l}: out of range");
+            assert_eq!((r[15], r[16]), (0, 0), "lane {l}: NaN");
+            assert_eq!(f(21), f16_to_f32(r[17] & 0xFFFF), "lane {l}");
+            assert_eq!(r[22], r[21], "lane {l}: the high half");
+            assert_eq!(r[25] >> 16, r[20] >> 16, "lane {l}: the half kept");
+            assert_eq!(r[26] & 0xFFFF, l as u32, "lane {l}: the half kept");
+            assert_eq!(r[29], (l != 0) as u32, "lane {l}: below the smallest denormal");
+            assert_eq!(r[30], 0x7FFF, "lane {l}: NaN");
+            assert_eq!(r[31], if l == 0 { 0 } else { 0x7C00 }, "lane {l}: overflow");
+        }
+        let lo = |l: usize, i: usize| v[l][i] & 0xFFFF;
+        assert_eq!([lo(0, 21), lo(1, 17), lo(30, 17)], [0, 0x0201, 0x3C1E]);
+        assert_eq!((f32::from_bits(v[1][21]), f32::from_bits(v[30][21])), (513.0 * 2f32.powi(-24), 1.0 + 30.0 / 1024.0), "f16 in");
+        // 1 + k · 2^-14 at k = 1, 8, 16, 24, 31: ties to even at 8 and 24
+        assert_eq!([1, 8, 16, 24, 31].map(|l| lo(l, 25)), [0x3C00, 0x3C00, 0x3C01, 0x3C02, 0x3C02]);
+        assert_eq!([0, 16, 18, 20].map(|l| v[l][26] >> 16), [0xC400, 0, 0x3800, 0x3C00], "f16 into the high half");
+        assert_eq!([0, 18, 20, 31].map(|l| lo(l, 32)), [0, 0x3800, 0x3C00, 0x3C00], "clamp");
+        assert_eq!(lo(0, 27), 0x0010, "2^-20: an f16 denormal");
+    }
+
+    pub(crate) fn check_f32_rounding(_: &[u32], v: &[Vec<u32>]) {
+        for (l, r) in v.iter().enumerate() {
+            let x = (l as i32 - 16) as f32 / 8.0;
+            let want = [x.floor(), x.ceil(), x.trunc(), x.round_ties_even(), x - x.floor()];
+            for (i, w) in want.iter().enumerate() {
+                assert_eq!(r[4 + i], w.to_bits(), "lane {l} v{}", 4 + i);
+            }
+            assert_eq!(r[9], 0x3F7F_FFFF, "fract(-2^-30): below 1.0");
+            assert_eq!(f32::from_bits(r[10]), 2.0 * (-x).floor(), "lane {l}");
+            assert_eq!(f32::from_bits(r[11]), x.abs() - x.abs().floor(), "lane {l}");
+        }
+    }
+
+    pub(crate) fn check_f32_three_source(_: &[u32], v: &[Vec<u32>]) {
+        let med3 = |a: f32, b: f32, c: f32| a.min(b).max(a.max(b).min(c));
+        for (l, r) in v.iter().enumerate() {
+            let f = |i: usize| f32::from_bits(r[i]);
+            let (x, y) = (l as f32, l as f32 - 16.0);
+            let a = if l % 4 == 0 { f32::from_bits(0x7FFF_FFFF) } else { x };
+            assert_eq!([f(6), f(7), f(8), f(9)], [x * 1.5 + y, x * y + 0.25, x * 1.5 + y, x * y + 0.25], "lane {l}");
+            assert_eq!([f(10), f(11), f(12)], [a.min(y).min(4.0), a.max(y).max(4.0), med3(a, y, 4.0)], "lane {l}");
+            assert_eq!(f(13), med3(y.abs(), -a, 4.0), "lane {l}");
+        }
+    }
+
+    pub(crate) fn check_f32_transcendentals(_: &[u32], v: &[Vec<u32>]) {
+        let sat = |x: f32| x.clamp(0.0, 1.0);
+        for (l, r) in v.iter().enumerate() {
+            let x = 1.0 + (l & 31) as f32 / 32.0;
+            let y = x - 1.5;
+            let t = y * 6.283_185_3;
+            assert_eq!((r[1], r[2]), (x.to_bits(), y.to_bits()), "lane {l}");
+            let want = [1.0 / x, 1.0 / x, 1.0 / x.sqrt(), x.sqrt(), y.exp2(), x.log2(), t.sin(), t.cos(), 2.0 * (-y).exp2(), sat(t.sin()), y.abs().log2()];
+            for (i, w) in want.iter().enumerate() {
+                assert!(f32_close(r[3 + i], w.to_bits()), "lane {l} v{}: {} against {w}", 3 + i, f32::from_bits(r[3 + i]));
+            }
+        }
+    }
+
+    /// The same bits, or within `approximate_float_unary_ops_are_within_tolerance`'s tolerance.
+    pub(crate) fn f32_close(a: u32, b: u32) -> bool {
+        let (a, b) = (f32::from_bits(a), f32::from_bits(b));
+        a.to_bits() == b.to_bits() || (a - b).abs() <= 1e-3f32.max(b.abs() * 1e-5)
+    }
+
     pub(crate) fn compute_cs() -> crate::gpu::recomp::CsInterface {
         crate::gpu::recomp::CsInterface { threads: [64, 1, 1], user_sgprs: 2, tgid: [true, false, false], tg_size: false, tid_components: 1 }
     }
@@ -2711,21 +2838,9 @@ pub(crate) mod tests {
 
     #[test]
     fn f32_arithmetic_with_vop3_modifiers() {
-        let sat = |x: f32| x.clamp(0.0, 1.0);
         let (s, v) = state(32);
-        let (_, v) = run(F32_ARITHMETIC, false, &s, &v);
-        for (l, r) in v.iter().enumerate() {
-            let f = |i: usize| f32::from_bits(r[i]);
-            let (p, x) = (f(1), f(2));
-            assert_eq!((p, x), (2f32.powi(l as i32), 2f32.powi(l as i32) * (1.0 + l as f32 / 64.0)), "lane {l}");
-            let y = x + 0.5;
-            let want = [y, x - p, x + 4.0, x * x, x.min(2.0), x.max(2.0), x * -2.0 + p, x * 0.5 + y, 4.0 * x + p, -0.5 * x + y, -x * 4.0, (x + p) * 0.5, (p - x) * 2.0, (p * p - x) * 4.0, sat((x - p) * 0.5), sat(2.0 - x)];
-            for (i, w) in want.iter().enumerate() {
-                assert_eq!(f(3 + i).to_bits(), w.to_bits(), "lane {l} v{}: {} against {w}", 3 + i, f(3 + i));
-            }
-            assert_eq!((r[20], r[21], r[22]), (r[2], r[2], 0), "lane {l}: NaN into min, max, clamp");
-            assert_eq!(f(23), 0.5 * x + p, "lane {l}: VOP3 fmac");
-        }
+        let (s, v) = run(F32_ARITHMETIC, false, &s, &v);
+        check_f32_arithmetic(&s, &v);
     }
 
     #[test]
@@ -2746,35 +2861,8 @@ pub(crate) mod tests {
     #[test]
     fn f32_conversions_round_and_saturate() {
         let (s, v) = state(32);
-        let (_, v) = run(F32_CONVERSIONS, false, &s, &v);
-        for (l, r) in v.iter().enumerate() {
-            let f = |i: usize| f32::from_bits(r[i]);
-            let (li, q) = (l as i32 - 16, (l as i32 - 16) as f32 / 4.0);
-            assert_eq!(f(2), li as f32, "lane {l}");
-            assert_eq!(f(4), ((l as u32) << 26 | l as u32) as f32, "lane {l}: u32 rounded to nearest even");
-            assert_eq!(f(5), (li as f32 * 0.5).clamp(0.0, 1.0), "lane {l}: omod and clamp");
-            assert_eq!(f(6), q, "lane {l}");
-            // the HLSL path's cvt_i32 / cvt_u32 saturate as Rust's `as` does, NaN giving 0
-            assert_eq!((r[7], r[8]), (q as i32 as u32, q as u32), "lane {l}: truncated");
-            assert_eq!((r[9], r[10]), ((q + 0.5).floor() as i32 as u32, q.floor() as i32 as u32), "lane {l}: rpi, flr");
-            assert_eq!((r[12], r[13], r[14]), (f(11) as i32 as u32, f(11) as u32, (-f(11)) as i32 as u32), "lane {l}: out of range");
-            assert_eq!((r[15], r[16]), (0, 0), "lane {l}: NaN");
-            assert_eq!(f(21), f16_to_f32(r[17] & 0xFFFF), "lane {l}");
-            assert_eq!(r[22], r[21], "lane {l}: the high half");
-            assert_eq!(r[25] >> 16, r[20] >> 16, "lane {l}: the half kept");
-            assert_eq!(r[26] & 0xFFFF, l as u32, "lane {l}: the half kept");
-            assert_eq!(r[29], (l != 0) as u32, "lane {l}: below the smallest denormal");
-            assert_eq!(r[30], 0x7FFF, "lane {l}: NaN");
-            assert_eq!(r[31], if l == 0 { 0 } else { 0x7C00 }, "lane {l}: overflow");
-        }
-        let lo = |l: usize, i: usize| v[l][i] & 0xFFFF;
-        assert_eq!([lo(0, 21), lo(1, 17), lo(30, 17)], [0, 0x0201, 0x3C1E]);
-        assert_eq!((f32::from_bits(v[1][21]), f32::from_bits(v[30][21])), (513.0 * 2f32.powi(-24), 1.0 + 30.0 / 1024.0), "f16 in");
-        // 1 + k · 2^-14 at k = 1, 8, 16, 24, 31: ties to even at 8 and 24
-        assert_eq!([1, 8, 16, 24, 31].map(|l| lo(l, 25)), [0x3C00, 0x3C00, 0x3C01, 0x3C02, 0x3C02]);
-        assert_eq!([0, 16, 18, 20].map(|l| v[l][26] >> 16), [0xC400, 0, 0x3800, 0x3C00], "f16 into the high half");
-        assert_eq!([0, 18, 20, 31].map(|l| lo(l, 32)), [0, 0x3800, 0x3C00, 0x3C00], "clamp");
-        assert_eq!(lo(0, 27), 0x0010, "2^-20: an f16 denormal");
+        let (s, v) = run(F32_CONVERSIONS, false, &s, &v);
+        check_f32_conversions(&s, &v);
     }
 
     #[test]
@@ -2794,17 +2882,9 @@ pub(crate) mod tests {
 
     #[test]
     fn f32_three_source_ops() {
-        let med3 = |a: f32, b: f32, c: f32| a.min(b).max(a.max(b).min(c));
         let (s, v) = state(32);
-        let (_, v) = run(F32_THREE_SOURCE, false, &s, &v);
-        for (l, r) in v.iter().enumerate() {
-            let f = |i: usize| f32::from_bits(r[i]);
-            let (x, y) = (l as f32, l as f32 - 16.0);
-            let a = if l % 4 == 0 { f32::from_bits(0x7FFF_FFFF) } else { x };
-            assert_eq!([f(6), f(7), f(8), f(9)], [x * 1.5 + y, x * y + 0.25, x * 1.5 + y, x * y + 0.25], "lane {l}");
-            assert_eq!([f(10), f(11), f(12)], [a.min(y).min(4.0), a.max(y).max(4.0), med3(a, y, 4.0)], "lane {l}");
-            assert_eq!(f(13), med3(y.abs(), -a, 4.0), "lane {l}");
-        }
+        let (s, v) = run(F32_THREE_SOURCE, false, &s, &v);
+        check_f32_three_source(&s, &v);
     }
 
     #[test]
@@ -2823,19 +2903,17 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn f32_transcendentals() {
+        let (s, v) = state(32);
+        let (s, v) = run(F32_TRANSCENDENTALS, false, &s, &v);
+        check_f32_transcendentals(&s, &v);
+    }
+
+    #[test]
     fn f32_rounding() {
         let (s, v) = state(32);
-        let (_, v) = run(F32_ROUNDING, false, &s, &v);
-        for (l, r) in v.iter().enumerate() {
-            let x = (l as i32 - 16) as f32 / 8.0;
-            let want = [x.floor(), x.ceil(), x.trunc(), x.round_ties_even(), x - x.floor()];
-            for (i, w) in want.iter().enumerate() {
-                assert_eq!(r[4 + i], w.to_bits(), "lane {l} v{}", 4 + i);
-            }
-            assert_eq!(r[9], 0x3F7F_FFFF, "fract(-2^-30): below 1.0");
-            assert_eq!(f32::from_bits(r[10]), 2.0 * (-x).floor(), "lane {l}");
-            assert_eq!(f32::from_bits(r[11]), x.abs() - x.abs().floor(), "lane {l}");
-        }
+        let (s, v) = run(F32_ROUNDING, false, &s, &v);
+        check_f32_rounding(&s, &v);
     }
 
     #[test]
@@ -2864,40 +2942,9 @@ pub(crate) mod tests {
 
     #[test]
     fn f32_compares_with_nan_and_vop3_modifiers() {
-        let preds: [fn(f32, f32) -> bool; 18] = [
-            |_, _| false,
-            |a, b| a < b,
-            |a, b| a == b,
-            |a, b| a <= b,
-            |a, b| a > b,
-            |a, b| a < b || a > b,
-            |a, b| a >= b,
-            |a, b| !a.is_nan() && !b.is_nan(),
-            |a, b| a.is_nan() || b.is_nan(),
-            |a, b| !(a >= b),
-            |a, b| !(a < b || a > b),
-            |a, b| !(a > b),
-            |a, b| !(a <= b),
-            |a, b| !(a == b),
-            |a, b| !(a < b),
-            |_, _| true,
-            |a, _| -a.abs() == -4.0,
-            |a, _| !(2.0 > -a),
-        ];
         let (s, v) = state(32);
         let (s, v) = run(F32_COMPARES, false, &s, &v);
-        let a: Vec<f32> = (0..32).map(|l| if l % 4 == 0 { f32::from_bits(0x7FFF_FFFF) } else { 2f32.powi(l) }).collect();
-        let mask = |p: &dyn Fn(f32) -> bool| (0..32).filter(|&l| p(a[l])).fold(0u32, |m, l| m | 1 << l);
-        for (k, p) in preds.iter().enumerate() {
-            assert_eq!(s[2 * k], mask(&|x| p(x, 4.0)), "s{}", 2 * k);
-        }
-        assert_eq!(s[106], mask(&|x| x < 4.0), "vcc");
-        assert_eq!(s[126], mask(&|x| x >= 4.0), "exec");
-        for (l, r) in v.iter().enumerate() {
-            assert_eq!(r[3], a[l].to_bits(), "lane {l}");
-            assert_eq!(r[6], if a[l] < 4.0 { r[1] } else { 0 }, "lane {l}: cndmask");
-            assert_eq!(r[7], if a[l] >= 4.0 { 1f32.to_bits() } else { 0 }, "lane {l}: under v_cmpx");
-        }
+        check_f32_compares(&s, &v);
     }
 
     #[test]

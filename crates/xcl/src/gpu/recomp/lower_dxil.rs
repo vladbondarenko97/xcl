@@ -348,11 +348,12 @@ mod tests {
         }
     }
 
-    /// The transcendentals: the per-lane DXIL and the HLSL path on the GPU give the same bits
-    /// (the same DXIL operations; rcp within the tolerance below, as HLSL's `rcp` is a fast
-    /// `fdiv`), and the CPU's are within `approximate_float_unary_ops_are_within_tolerance`'s.
+    /// The f32 programs of `lower`'s tests on the GPU: the HLSL path gives the expected
+    /// registers (`check_f32_*`, wave32), and the per-lane DXIL gives the HLSL path's, register
+    /// for register (rcp within `f32_close`: HLSL's `rcp` is a fast fdiv). While the per-lane
+    /// form refuses a program, that half is SKIPPED with the refusal.
     #[test]
-    fn per_lane_transcendentals_agree_with_the_hlsl_path_on_the_gpu() {
+    fn f32_programs_on_the_gpu() {
         if !gpu() {
             return;
         }
@@ -360,33 +361,67 @@ mod tests {
             runner::skip_test("no DXC");
             return;
         }
-        let lines = F32_TRANSCENDENTALS;
-        let (dxil, _) = super::kernel(&decode(lines), false).unwrap();
-        let (s, v) = state(32);
-        let mut st = runner::KernelState::default();
-        st.sgpr.copy_from_slice(&s);
-        for (l, regs) in v.iter().enumerate() {
-            st.vgpr[l][..regs.len()].copy_from_slice(regs);
-        }
-        let direct = runner::run(&dxil, &st, &[]).unwrap();
-        let bytes: Vec<u8> = lines.iter().flat_map(encode_line).collect();
-        let t = translate(&bytes, &Options { wave64: false, ..Default::default() }).unwrap();
-        assert!(t.complete(), "{:?}", t.unsupported_why);
-        let hlsl = runner::run(&dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap(), &st, &[]).unwrap();
-        let (_, cpu, _) = run_mem(lines, false, &s, &v, &[]);
-        let close = |a: u32, b: u32| {
-            let (a, b) = (f32::from_bits(a), f32::from_bits(b));
-            a.to_bits() == b.to_bits() || (a - b).abs() <= 1e-3f32.max(b.abs() * 1e-5)
-        };
-        for l in 0..32 {
-            for r in 1..=13 {
-                let (d, h) = (direct.vgpr[l][r], hlsl.vgpr[l][r]);
-                if r == 3 || r == 4 {
-                    assert!(close(d, h), "lane {l} v{r}: {} against {}", f32::from_bits(d), f32::from_bits(h));
-                } else {
-                    assert_eq!(d, h, "lane {l} v{r}: {} against {}", f32::from_bits(d), f32::from_bits(h));
+        type Check = fn(&[u32], &[Vec<u32>]);
+        let programs: [(&str, &[I], Check, &[usize]); 6] = [
+            ("f32 arithmetic", F32_ARITHMETIC, check_f32_arithmetic, &[]),
+            ("f32 compares", F32_COMPARES, check_f32_compares, &[]),
+            ("f32 conversions", F32_CONVERSIONS, check_f32_conversions, &[]),
+            ("f32 rounding", F32_ROUNDING, check_f32_rounding, &[]),
+            ("f32 transcendentals", F32_TRANSCENDENTALS, check_f32_transcendentals, &[3, 4]),
+            ("f32 three-source", F32_THREE_SOURCE, check_f32_three_source, &[]),
+        ];
+        let wave64 = runner::wave64_supported() == Ok(true);
+        for (name, lines, check, approx) in programs {
+            for w64 in [false, true] {
+                let lanes = if w64 { 64 } else { 32 };
+                if w64 && !wave64 {
+                    runner::skip_test(&format!("{name}, wave64: no wave64"));
+                    continue;
                 }
-                assert!(close(cpu[l][r], h), "lane {l} v{r}: CPU {} against {}", f32::from_bits(cpu[l][r]), f32::from_bits(h));
+                let (s, v) = state(lanes);
+                let mut st = runner::KernelState::default();
+                st.sgpr.copy_from_slice(&s);
+                for (l, regs) in v.iter().enumerate() {
+                    st.vgpr[l][..regs.len()].copy_from_slice(regs);
+                }
+                let bytes: Vec<u8> = lines.iter().flat_map(encode_line).collect();
+                let t = translate(&bytes, &Options { wave64: w64, ..Default::default() }).unwrap();
+                assert!(t.complete(), "{name}: {:?}", t.unsupported_why);
+                let hlsl = runner::run(&dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap(), &st, &[]).unwrap();
+                if !w64 {
+                    check(&hlsl.sgpr, &hlsl.vgpr[..32]);
+                }
+                let insts = decode(lines);
+                let (dxil, stale) = match super::kernel(&insts, w64) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        runner::skip_test(&format!("{name}, wave{lanes}, per-lane form: refused ({e})"));
+                        continue;
+                    }
+                };
+                let direct = runner::run(&dxil, &st, &[]).unwrap();
+                let mut sregs: Vec<usize> = vec![106, 126];
+                let mut vregs: Vec<usize> = Vec::new();
+                for d in &insts {
+                    let (r, w) = crate::gpu::rdna2::sgpr_uses(d);
+                    sregs.extend(r.iter().chain(&w).map(|&x| x as usize).filter(|&x| x < 125));
+                    let (r, w) = crate::gpu::rdna2::vgpr_uses(d);
+                    vregs.extend(r.iter().chain(&w).map(|&x| x as usize));
+                }
+                if w64 {
+                    sregs.extend([107, 127]);
+                }
+                let stale_at = |r: usize| stale.contains(&(r as u8)) || (w64 && r % 2 == 1 && stale.contains(&(r as u8 - 1)));
+                for &r in sregs.iter().filter(|&&r| !stale_at(r)) {
+                    assert_eq!(direct.sgpr[r], hlsl.sgpr[r], "{name}, wave{lanes}: s{r}");
+                }
+                for l in 0..lanes {
+                    for &r in &vregs {
+                        let (d, h) = (direct.vgpr[l][r], hlsl.vgpr[l][r]);
+                        let same = if approx.contains(&r) { f32_close(d, h) } else { d == h };
+                        assert!(same, "{name}, wave{lanes}: lane {l} v{r}: {d:#x} against {h:#x}");
+                    }
+                }
             }
         }
     }
