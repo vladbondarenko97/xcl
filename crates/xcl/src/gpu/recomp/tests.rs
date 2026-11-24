@@ -6897,6 +6897,145 @@ fn gpu_f16_defaults_to_round_to_nearest_even() {
     );
 }
 
+/// A finite f16 as an exact integer in units of 2^-24.
+fn f16_units(h: u16) -> i128 {
+    let (e, m) = ((h >> 10) & 0x1F, (h & 0x3FF) as i128);
+    let mag = if e == 0 { m } else { (m | 0x400) << (e - 1) };
+    if h & 0x8000 != 0 { -mag } else { mag }
+}
+
+/// An exact value in units of 2^-`u` (u >= 24) as f16, rounded to nearest, ties to even; `neg0`: the
+/// sign of an exact zero.
+fn f16_rne_exact(v: i128, u: u32, neg0: bool) -> u16 {
+    let sign = if v < 0 || (v == 0 && neg0) { 0x8000u16 } else { 0 };
+    let m = v.unsigned_abs();
+    if m == 0 {
+        return sign;
+    }
+    let q = (127 - m.leading_zeros()).saturating_sub(10).max(u - 24); // log2 of the quantum, in units
+    let (mut k, r) = (m >> q, m & ((1u128 << q) - 1));
+    if q > 0 {
+        let half = 1u128 << (q - 1);
+        k += (r > half || (r == half && k & 1 == 1)) as u128;
+    }
+    let (mut k, mut q) = (k, q);
+    if k == 2048 {
+        k = 1024;
+        q += 1;
+    }
+    if k < 1024 {
+        return sign | k as u16; // subnormal
+    }
+    let biased = q + 25 - u;
+    if biased >= 31 {
+        return sign | 0x7C00;
+    }
+    sign | (biased as u16) << 10 | (k - 1024) as u16
+}
+
+/// A random finite binary16 (exponent `e`, or any).
+fn half(rnd: &mut impl FnMut() -> u32, e: Option<u32>) -> u16 {
+    let e = e.unwrap_or(rnd() % 31).min(30);
+    ((rnd() & 1) << 15 | e << 10 | rnd() & 0x3FF) as u16
+}
+
+#[test]
+fn gpu_f16_arithmetic_rounds_to_nearest_even() {
+    if !gpu_ready() {
+        return;
+    }
+    // f32tof16 rounds toward zero on NVIDIA: add / sub / fma / fmac / ldexp and the packed add / fma
+    // must round the (exact or sticky) result to nearest even like v_mul_f16.
+    let code = prog(&[
+        ("V_ADD_F16", "ENC_VOP2", &[("VDST", 10), ("SRC0", V), ("VSRC1", 1)], None),
+        ("V_SUB_F16", "ENC_VOP2", &[("VDST", 11), ("SRC0", V), ("VSRC1", 1)], None),
+        ("V_FMA_F16", "ENC_VOP3", &[("VDST", 12), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+        ("V_LDEXP_F16", "ENC_VOP3", &[("VDST", 13), ("SRC0", V), ("SRC1", V + 3)], None),
+        ("V_PK_ADD_F16", "ENC_VOP3P", &[("VDST", 14), ("SRC0", V), ("SRC1", V + 1), ("OP_SEL_HI", 3), ("OP_SEL_HI_2", 1)], None),
+        ("V_PK_FMA_F16", "ENC_VOP3P", &[("VDST", 15), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2), ("OP_SEL_HI", 3), ("OP_SEL_HI_2", 1)], None),
+        ("V_FMAC_F16", "ENC_VOP2", &[("VDST", 16), ("SRC0", V), ("VSRC1", 1)], None),
+    ]);
+    let opt = Options { wave64: false, hw_wave: 32, ..Options::default() };
+    let t = translate(&code, &opt).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+
+    let add = |a: u16, b: u16| f16_rne_exact(f16_units(a) + f16_units(b), 24, a == 0x8000 && b == 0x8000);
+    let sub = |a: u16, b: u16| add(a, b ^ 0x8000);
+    let fma = |a: u16, b: u16, c: u16| {
+        let p = f16_units(a) * f16_units(b); // units of 2^-48
+        f16_rne_exact(p + (f16_units(c) << 24), 48, false)
+    };
+    let ldexp = |a: u16, n: i32| f16_rne_exact(if n >= 0 { f16_units(a) << (40 + n) } else { f16_units(a) << 40 >> -n }, 64, false);
+    // the cases that failed on an RTX 3080 Ti, and a fma whose f32 sum is a tie only after rounding
+    // (0x3C01 * 0x0FFE + 0x3C01 is just above the midpoint of 0x3C01 and 0x3C02: 0x3C01 is right)
+    assert_eq!(add(0x3C01, 0x1000), 0x3C02);
+    assert_eq!(fma(0x3C01, 0x0FFE, 0x3C01), 0x3C01);
+
+    let mut seed = 0x2545_F491_4F6C_DD1Du64;
+    let mut rnd = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (seed >> 33) as u32
+    };
+    let mut bad = Vec::new();
+    for batch in 0..128 {
+        let mut st = KernelState::default();
+        st.sgpr[127] = 0;
+        let mut ops = Vec::new();
+        for lane in 0..32usize {
+            // a: any finite half; b, c: exponents near a's (or the product's) so sums sit near ties
+            let (mut a, mut b, c, n);
+            if batch == 0 && lane < 3 {
+                (a, b, c, n) = [(0x3C01u16, 0x1000u16, 0x3C01u16, 0i32), (0x3C01, 0x0FFE, 0x3C01, -1), (0x0207, 0x3C00, 0x3C00, -3)][lane];
+            } else {
+                a = half(&mut rnd, None);
+                let ea = ((a >> 10) & 0x1F) as u32;
+                let e = ea.saturating_sub(rnd() % 16);
+                b = half(&mut rnd, Some(e));
+                if rnd() & 1 == 1 {
+                    let (eb, ea) = (10 + rnd() % 10, 10 + rnd() % 10); // a product with c nearby
+                    b = half(&mut rnd, Some(eb));
+                    a = half(&mut rnd, Some(ea));
+                }
+                let ep = (((a >> 10) & 0x1F) as u32 + ((b >> 10) & 0x1F) as u32).saturating_sub(15);
+                let e = (ep + rnd() % 7).saturating_sub(3);
+                c = half(&mut rnd, Some(e));
+                n = (rnd() % 56) as i32 - 40;
+            }
+            // packed high lane: independent values
+            let (e2, e3) = (rnd() % 31, 10 + rnd() % 10);
+            let (a2, b2, c2) = (half(&mut rnd, None), half(&mut rnd, Some(e2)), half(&mut rnd, Some(e3)));
+            st.vgpr[lane][0] = (a2 as u32) << 16 | a as u32;
+            st.vgpr[lane][1] = (b2 as u32) << 16 | b as u32;
+            st.vgpr[lane][2] = (c2 as u32) << 16 | c as u32;
+            st.vgpr[lane][3] = n as i16 as u16 as u32;
+            st.vgpr[lane][16] = c as u32;
+            ops.push((a, b, c, n, a2, b2, c2));
+        }
+        let r = runner::run(&dxil, &st, &[]).unwrap();
+        for (lane, &(a, b, c, n, a2, b2, c2)) in ops.iter().enumerate() {
+            let v = &r.vgpr[lane];
+            let want: [(&str, u16, u16); 8] = [
+                ("v_add_f16", v[10] as u16, add(a, b)),
+                ("v_sub_f16", v[11] as u16, sub(a, b)),
+                ("v_fma_f16", v[12] as u16, fma(a, b, c)),
+                ("v_ldexp_f16", v[13] as u16, ldexp(a, n)),
+                ("v_pk_add_f16 lo", v[14] as u16, add(a, b)),
+                ("v_pk_add_f16 hi", (v[14] >> 16) as u16, add(a2, b2)),
+                ("v_pk_fma_f16 hi", (v[15] >> 16) as u16, fma(a2, b2, c2)),
+                ("v_fmac_f16", v[16] as u16, fma(a, b, c)),
+            ];
+            for (name, got, exp) in want {
+                // a NaN result (inf - inf cannot occur: the inputs are finite)
+                if got != exp {
+                    bad.push(format!("{name} a={a:04x} b={b:04x} c={c:04x} n={n} a2={a2:04x} b2={b2:04x} c2={c2:04x}: got {got:04x}, want {exp:04x}"));
+                }
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{} wrong:\n{}", bad.len(), bad.iter().take(20).cloned().collect::<Vec<_>>().join("\n"));
+}
+
 #[test]
 fn gpu_s_round_mode_controls_f16_rounding_across_modes() {
     if !gpu_ready() {

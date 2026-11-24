@@ -2730,8 +2730,9 @@ impl Em {
         let dyn_rm = self.dynamic_f16_rm;
         let fr = |e: String| {
             let s = if clamp { format!("saturate({e})") } else { e };
-            // The product of two binary16 operands fits exactly in binary32.
-            if name == "v_pk_mul_f16" {
+            // Exact in binary32 (a product of two halves) or rounded once, right (the sum:
+            // f32 has 2p+2 bits; fma: `fma_rto` keeps the sticky bit). `f32tof16` truncates.
+            if matches!(name, "v_pk_mul_f16" | "v_pk_add_f16" | "v_pk_fma_f16" | "v_pk_fmac_f16") {
                 to_f16_rounded_expr(dyn_rm, &s)
             } else {
                 to_f16_expr(dyn_rm, &s)
@@ -2794,8 +2795,8 @@ impl Em {
             Some(match name {
                 "v_pk_add_f16" => fr(format!("{} + {}", fh(0, hi), fh(1, hi))),
                 "v_pk_mul_f16" => fr(format!("{} * {}", fh(0, hi), fh(1, hi))),
-                "v_pk_fma_f16" => fr(format!("mad({}, {}, {})", fh(0, hi), fh(1, hi), fh(2, hi))),
-                "v_pk_fmac_f16" => fr(format!("mad({}, {}, f16tof32({curh}))", fh(0, hi), fh(1, hi))),
+                "v_pk_fma_f16" => fr(format!("fma_rto({}, {}, {})", fh(0, hi), fh(1, hi), fh(2, hi))),
+                "v_pk_fmac_f16" => fr(format!("fma_rto({}, {}, f16tof32({curh}))", fh(0, hi), fh(1, hi))),
                 "v_pk_min_f16" => fr(format!("min({}, {})", fh(0, hi), fh(1, hi))),
                 "v_pk_max_f16" => fr(format!("max({}, {})", fh(0, hi), fh(1, hi))),
                 // integer clamp saturates each half
@@ -2966,7 +2967,11 @@ impl Em {
             if m.clamp {
                 s = format!("saturate({s})");
             }
-            if name == "v_mul_f16" {
+            // exact in binary32 or rounded once (see the packed `fr`); `f32tof16` truncates
+            if matches!(
+                name,
+                "v_mul_f16" | "v_add_f16" | "v_sub_f16" | "v_subrev_f16" | "v_ldexp_f16" | "v_fma_f16" | "v_fmac_f16" | "v_fmamk_f16" | "v_fmaak_f16"
+            ) {
                 to_f16_rounded_expr(dyn_rm, &s)
             } else {
                 to_f16_expr(dyn_rm, &s)
@@ -2986,7 +2991,7 @@ impl Em {
             "v_mul_f16" => fr(format!("{} * {}", fh(0), fh(1))),
             "v_min_f16" => fr(format!("min({}, {})", fh(0), fh(1))),
             "v_max_f16" => fr(format!("max({}, {})", fh(0), fh(1))),
-            "v_fma_f16" => fr(format!("mad({}, {}, {})", fh(0), fh(1), fh(2))),
+            "v_fma_f16" => fr(format!("fma_rto({}, {}, {})", fh(0), fh(1), fh(2))),
             "v_med3_f16" => fr(format!("med3f({}, {}, {})", fh(0), fh(1), fh(2))),
             "v_min3_f16" => fr(format!("min(min({}, {}), {})", fh(0), fh(1), fh(2))),
             "v_max3_f16" => fr(format!("max(max({}, {}), {})", fh(0), fh(1), fh(2))),
@@ -3003,9 +3008,9 @@ impl Em {
                 let rm = if dyn_rm { "xcl_fp16_rm" } else { "0u" };
                 fr(format!("mad_nf_f16({}, {}, {}, {rm})", fh(0), fh(1), fh(2)))
             }
-            "v_fmac_f16" => fr(format!("mad({}, {}, f16tof32({curh}))", fh(0), fh(1))),
-            "v_fmamk_f16" => fr(format!("mad({}, f16tof32({} & 0xFFFFu), {})", fh(0), u[1], fh(2))),
-            "v_fmaak_f16" => fr(format!("mad({}, {}, f16tof32({} & 0xFFFFu))", fh(0), fh(1), u[2])),
+            "v_fmac_f16" => fr(format!("fma_rto({}, {}, f16tof32({curh}))", fh(0), fh(1))),
+            "v_fmamk_f16" => fr(format!("fma_rto({}, f16tof32({} & 0xFFFFu), {})", fh(0), u[1], fh(2))),
+            "v_fmaak_f16" => fr(format!("fma_rto({}, {}, f16tof32({} & 0xFFFFu))", fh(0), fh(1), u[2])),
             "v_ldexp_f16" => fr(format!("ldexp({}, (float){})", fh(0), si(1))),
             "v_rcp_f16" => fr(format!("rcp({})", fh(0))),
             "v_rsq_f16" => fr(format!("rsqrt({})", fh(0))),
@@ -5678,6 +5683,21 @@ uint f32_to_f16_rm(float f, uint rm) {
     bool dir_inc = and(rem != 0u, or(and(rm == 1u, sign == 0u), and(rm == 2u, sign != 0u)));
     bool inc = select(rm == 0u, rne_inc, dir_inc);
     return sign | (h + (uint)inc);
+}
+// a * b + c of two binary16 and a binary16 / f32 c, rounded to f32 to odd: the product is exact, the
+// TwoSum error picks the odd neighbour when the sum is inexact, so the later binary16 rounding (any
+// mode) sees the exact value's side of every tie (an f32 RNE sum would double-round).
+float fma_rto(float a, float b, float c) {
+    precise float p = a * b;
+    precise float s = p + c;
+    precise float bb = s - p;
+    precise float err = (p - (s - bb)) + (c - bb);
+    uint x = asuint(s);
+    if (and(and(isfinite(s), isfinite(err)), and(err != 0.0f, (x & 1u) == 0u))) {
+        x = select((s > 0.0f) == (err > 0.0f), x + 1u, x - 1u);
+        s = asfloat(x);
+    }
+    return s;
 }
 float mad_nf_f16(float a, float b, float c, uint rm) { precise float p = a * b; float p16 = f16tof32(f32_to_f16_rm(p, rm)); precise float r = p16 + c; return r; }
 float med3f(float a, float b, float c) { return max(min(a, b), min(max(a, b), c)); }
