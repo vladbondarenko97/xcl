@@ -308,6 +308,10 @@ struct RecompAgg {
     wave_resolved: BTreeMap<String, usize>,
     /// `--example MNEMONIC`: listing of the first program missing it, its HLSL and profile
     example: Option<(String, String, &'static str)>,
+    /// `lane_masks` (direct DXIL): programs analysed, those with no guard left, vector
+    /// instructions, those still guarded, lane branches, uniform branches; failures by reason
+    lanes: [usize; 6],
+    lanes_failed: BTreeMap<String, usize>,
 }
 
 impl RecompAgg {
@@ -348,6 +352,12 @@ impl RecompAgg {
             e.1 += b;
         }
         self.hlsl_bytes += o.hlsl_bytes;
+        for (a, b) in self.lanes.iter_mut().zip(o.lanes) {
+            *a += b;
+        }
+        for (k, v) in o.lanes_failed {
+            *self.lanes_failed.entry(k).or_default() += v;
+        }
     }
 
     fn add(&mut self, name: &str, code: &[u8], keep: usize, mode: recomp::Mode) {
@@ -387,6 +397,15 @@ impl RecompAgg {
             } else {
                 self.graphics_wave32 += 1;
             }
+        }
+        match recomp::lane_masks::analyze_code(code, wave64) {
+            Ok(s) => {
+                let counts = [1, s.guarded.is_empty() as usize, s.vector, s.guarded.len(), s.lane_branches, s.uniform_branches];
+                for (a, b) in self.lanes.iter_mut().zip(counts) {
+                    *a += b;
+                }
+            }
+            Err(why) => *self.lanes_failed.entry(why.to_string()).or_default() += 1,
         }
         // `XCL_RECOMP_WINDOWS=4`: as a title with unified memory translates (`pso::mem_windows`)
         let mem_windows = std::env::var("XCL_RECOMP_WINDOWS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
@@ -1227,6 +1246,19 @@ fn print(path: &Path, what: &str, agg: Agg, top: usize, json: bool, t0: std::tim
         println!(
             "VS/PS and the wave size (the driver picks it): wave32 {} (handled – the halves of a 64-wide wave run separately), wave64 {}; hazards in 32-thread waves: {:?}; reads of lanes ≥ 32 resolved (32-lane GPUs): {:?}",
             rc.graphics_wave32, rc.graphics_wave64, rc.wave_hazards, rc.wave_resolved
+        );
+        let l = &rc.lanes;
+        println!(
+            "lane masks (direct DXIL, no EXEC emulation): analysed {} of {} programs, {} with no guard left; vector instructions {}, still guarded {} ({:.1}%); branches per lane {}, uniform {}; not analysed: {:?}",
+            l[0],
+            rc.programs,
+            l[1],
+            l[2],
+            l[3],
+            l[3] as f64 * 100.0 / l[2].max(1) as f64,
+            l[4],
+            l[5],
+            rc.lanes_failed
         );
         if let Some((x, hlsl, profile)) = &rc.example {
             println!("example:
