@@ -64,6 +64,9 @@ pub trait Ir: Sink {
     fn zext(&mut self, b: Self::V) -> Self::V;
     /// the console lane of this thread
     fn lane(&mut self) -> Self::V;
+    /// compute: the group's id and the thread's id in its group, component k (x, y, z)
+    fn group_id(&mut self, k: u32) -> Self::V;
+    fn thread_id(&mut self, k: u32) -> Self::V;
     /// the wave's ballot of `c`: lanes 0–31, 32–63
     fn ballot(&mut self, c: Self::V) -> [Self::V; 2];
     fn io_load(&mut self, dword: Self::V) -> Self::V;
@@ -79,6 +82,16 @@ pub trait Ir: Sink {
 
 const EXEC: u8 = 126;
 const VCC: u8 = 106;
+
+/// The program's stage: where its registers come from and go.
+#[derive(Clone, Copy)]
+pub enum Stage<'a> {
+    /// `runner`'s ABI: the whole register file from `io`, back to `res`
+    Kernel,
+    /// a compute program: user SGPRs from `io`, then the group ids and TG_SIZE it enables,
+    /// thread ids in v0–v2; it ends without storing registers
+    Compute(&'a super::CsInterface),
+}
 
 struct Lower<'a, I: Ir> {
     ir: I,
@@ -717,7 +730,22 @@ fn partial_blocks(sum: &Summary) -> Vec<bool> {
 /// the mask registers whose value at the end may differ from the console's: written in a block
 /// some lanes skipped, so those lanes still hold their own older bits (`stale`). Nothing reads
 /// them in the program (that would be refused); only the kernel ABI's store of every register.
-pub fn lower_kernel<I: Ir>(insts: &[Decoded], wave64: bool, mut ir: I) -> R<(I, Vec<u8>)> {
+pub fn lower_kernel<I: Ir>(insts: &[Decoded], wave64: bool, ir: I) -> R<(I, Vec<u8>)> {
+    lower(insts, Stage::Kernel, wave64, ir)
+}
+
+/// Lowers a compute program (far jumps resolved) into `ir`. One-dimensional groups only for
+/// now: in a 2-D / 3-D group the PC driver need not give a wave consecutive threads, which the
+/// console does (`emit` reorders them; not done here yet).
+pub fn lower_compute<I: Ir>(insts: &[Decoded], cs: &super::CsInterface, wave64: bool, ir: I) -> R<I> {
+    if cs.threads[1] * cs.threads[2] > 1 {
+        return Err("2-D / 3-D thread group".into());
+    }
+    Ok(lower(insts, Stage::Compute(cs), wave64, ir)?.0)
+}
+
+fn lower<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I) -> R<(I, Vec<u8>)> {
+    let kernel = matches!(stage, Stage::Kernel);
     let sum = lane_masks::analyze(insts, wave64).map_err(|e| e.to_string())?;
     let n = sum.blocks.len();
     if n == 0 {
@@ -767,10 +795,14 @@ pub fn lower_kernel<I: Ir>(insts: &[Decoded], wave64: bool, mut ir: I) -> R<(I, 
             prev = c;
         }
     }
-    preds[skip] = vec![0];
-    preds[exit] = std::iter::once(skip).chain(ends.iter().map(|&b| tail[b])).collect();
-    preds[sstore] = vec![exit];
-    preds[vstore] = vec![exit, sstore];
+    // compute: every lane that runs is in EXEC, and nothing is stored at the end – the skip and
+    // store blocks are left unreachable (a bare `ret`)
+    if kernel {
+        preds[skip] = vec![0];
+        preds[sstore] = vec![exit];
+        preds[vstore] = vec![exit, sstore];
+    }
+    preds[exit] = kernel.then_some(skip).into_iter().chain(ends.iter().map(|&b| tail[b])).collect();
     for i in 0..count {
         let id = ir.new_block();
         debug_assert_eq!(id, i);
@@ -808,7 +840,7 @@ pub fn lower_kernel<I: Ir>(insts: &[Decoded], wave64: bool, mut ir: I) -> R<(I, 
     vregs.sort_unstable();
     vregs.dedup();
 
-    // prologue: the register file from `io`; lanes outside EXEC go straight to the end
+    // prologue: the SGPRs from `io` (kernel: the whole register file; compute: the user data)
     l.ir.at(0);
     l.ssa.seal(&mut l.ir, 0);
     let lane = l.lane();
@@ -817,31 +849,79 @@ pub fn lower_kernel<I: Ir>(insts: &[Decoded], wave64: bool, mut ir: I) -> R<(I, 
         let v = l.ir.io_load(a);
         l.write_num(0, r, v);
     }
-    let a = l.ir.int(KERNEL_SCC_SLOT as u32);
-    let scc = l.ir.io_load(a);
-    let z = l.ir.int(0);
-    let scc = l.ir.icmp(Cmp::Ne, scc, z);
-    l.ssa.write(0, Var::Scc, scc);
-    let (base, stride) = (l.ir.int(KERNEL_SGPRS as u32), l.ir.int(KERNEL_VGPRS as u32));
-    let row = l.ir.bin(Bin::Mul, lane, stride);
-    let row = l.ir.bin(Bin::Add, base, row);
-    for &v in &vregs {
-        let o = l.ir.int(v as u32);
-        let a = l.ir.bin(Bin::Add, row, o);
-        let x = l.ir.io_load(a);
-        l.ssa.write(0, Var::V(v), x);
+    let mut row = None;
+    match stage {
+        Stage::Kernel => {
+            let a = l.ir.int(KERNEL_SCC_SLOT as u32);
+            let scc = l.ir.io_load(a);
+            let z = l.ir.int(0);
+            let scc = l.ir.icmp(Cmp::Ne, scc, z);
+            l.ssa.write(0, Var::Scc, scc);
+            let (base, stride) = (l.ir.int(KERNEL_SGPRS as u32), l.ir.int(KERNEL_VGPRS as u32));
+            let r = l.ir.bin(Bin::Mul, lane, stride);
+            let r = l.ir.bin(Bin::Add, base, r);
+            for &v in &vregs {
+                let o = l.ir.int(v as u32);
+                let a = l.ir.bin(Bin::Add, r, o);
+                let x = l.ir.io_load(a);
+                l.ssa.write(0, Var::V(v), x);
+            }
+            row = Some(r);
+            // lanes outside EXEC go straight to the end
+            let active = l.read_bit(0, EXEC)?;
+            l.write_bit(0, EXEC, active);
+            l.ir.br_if(active, blk(0), skip);
+            // … with their bits of every mask 0, as a whole-wave write leaves them
+            l.ir.at(skip);
+            l.ssa.seal(&mut l.ir, skip);
+            let f = l.ir.boolean(false);
+            for &r in &sregs {
+                l.ssa.write(skip, Var::M(r), f);
+            }
+            l.ir.br(exit);
+        }
+        Stage::Compute(cs) => {
+            // system SGPRs after the user data: the enabled group ids, then TG_SIZE
+            let mut next = cs.user_sgprs as u8;
+            for k in 0..3 {
+                if cs.tgid[k as usize] {
+                    let g = l.ir.group_id(k);
+                    l.write_num(0, next, g);
+                    next += 1;
+                }
+            }
+            if cs.tg_size {
+                // waves in the group (a last partial one counts) | this wave's index << 6
+                let lanes = if wave64 { 64 } else { 32 };
+                let waves = l.ir.int(cs.threads.iter().product::<u32>().div_ceil(lanes));
+                let t = l.ir.thread_id(0);
+                let sh = l.ir.int(lanes.trailing_zeros());
+                let w = l.ir.bin(Bin::LShr, t, sh);
+                let six = l.ir.int(6);
+                let w = l.ir.bin(Bin::Shl, w, six);
+                let v = l.ir.bin(Bin::Or, waves, w);
+                l.write_num(0, next, v);
+            }
+            let f = l.ir.boolean(false);
+            l.ssa.write(0, Var::Scc, f);
+            for &v in &vregs {
+                let x = match v {
+                    0 => l.ir.thread_id(0),
+                    1 if cs.tid_components >= 2 => l.ir.thread_id(1),
+                    2 if cs.tid_components >= 3 => l.ir.thread_id(2),
+                    _ => l.ir.int(0),
+                };
+                l.ssa.write(0, Var::V(v), x);
+            }
+            // every lane that runs is in EXEC
+            let t = l.ir.boolean(true);
+            l.write_bit(0, EXEC, t);
+            l.ir.br(blk(0));
+            l.ir.at(skip);
+            l.ssa.seal(&mut l.ir, skip);
+            l.ir.ret();
+        }
     }
-    let active = l.read_bit(0, EXEC)?;
-    l.write_bit(0, EXEC, active);
-    l.ir.br_if(active, blk(0), skip);
-    // lanes outside EXEC: their bits of every mask are 0, as a whole-wave write leaves them
-    l.ir.at(skip);
-    l.ssa.seal(&mut l.ir, skip);
-    let f = l.ir.boolean(false);
-    for &r in &sregs {
-        l.ssa.write(skip, Var::M(r), f);
-    }
-    l.ir.br(exit);
 
     // the program, in reverse postorder; a block is sealed once all its predecessors are in
     let mut done = vec![false; count];
@@ -933,11 +1013,21 @@ pub fn lower_kernel<I: Ir>(insts: &[Decoded], wave64: bool, mut ir: I) -> R<(I, 
         }
     }
 
-    // exit: every lane is here; masks the runner reads as numbers are the wave's ballots
     l.ir.at(exit);
     l.ssa.seal(&mut l.ir, exit);
-    let mut sval: Vec<(u8, I::V)> = Vec::new();
     let mut stale: Vec<u8> = Vec::new();
+    let Some(row) = row else {
+        // compute: nothing to store
+        l.ir.ret();
+        for b in [sstore, vstore] {
+            l.ir.at(b);
+            l.ssa.seal(&mut l.ir, b);
+            l.ir.ret();
+        }
+        return l.finish(stale);
+    };
+    // kernel exit: every lane is here; masks the runner reads as numbers are the wave's ballots
+    let mut sval: Vec<(u8, I::V)> = Vec::new();
     let mut i = 0;
     while i < sregs.len() {
         let r = sregs[i];
@@ -992,26 +1082,32 @@ pub fn lower_kernel<I: Ir>(insts: &[Decoded], wave64: bool, mut ir: I) -> R<(I, 
         l.ir.res_store(a, x);
     }
     l.ir.ret();
+    l.finish(stale)
+}
 
-    // every phi is complete: no number may come from a mask, nor a mask bit from a number
-    for &v in &l.num_uses {
-        if l.reaches(v, l.num_marker) {
-            return Err("a mask read as a number (through a join)".into());
+impl<I: Ir> Lower<'_, I> {
+    /// Every phi is complete: no number may come from a mask, nor a mask bit from a number, nor
+    /// a lane read a mask bit it kept from before a write it skipped.
+    fn finish(self, mut stale: Vec<u8>) -> R<(I, Vec<u8>)> {
+        for &v in &self.num_uses {
+            if self.reaches(v, self.num_marker) {
+                return Err("a mask read as a number (through a join)".into());
+            }
         }
-    }
-    for &v in &l.bit_uses {
-        if l.reaches(v, l.bit_marker) {
-            return Err("a number read as a mask (through a join)".into());
+        for &v in &self.bit_uses {
+            if self.reaches(v, self.bit_marker) {
+                return Err("a number read as a mask (through a join)".into());
+            }
         }
-    }
-    for &(c, v) in &l.lane_uses {
-        if l.stale(c, v) {
-            return Err("a mask written while some lanes were elsewhere, read after they met again".into());
+        for &(c, v) in &self.lane_uses {
+            if self.stale(c, v) {
+                return Err("a mask written while some lanes were elsewhere, read after they met again".into());
+            }
         }
+        stale.sort_unstable();
+        stale.dedup();
+        Ok((self.ir, stale))
     }
-    stale.sort_unstable();
-    stale.dedup();
-    Ok((l.ir, stale))
 }
 
 #[cfg(test)]
@@ -1030,6 +1126,8 @@ mod tests {
         Select(u32, u32, u32),
         Zext(u32),
         Lane,
+        GroupId(u32),
+        ThreadId(u32),
         Ballot(u32, usize),
         IoLoad(u32),
         ResStore(u32, u32),
@@ -1137,6 +1235,12 @@ mod tests {
         fn lane(&mut self) -> u32 {
             self.push(Ins::Lane)
         }
+        fn group_id(&mut self, k: u32) -> u32 {
+            self.push(Ins::GroupId(k))
+        }
+        fn thread_id(&mut self, k: u32) -> u32 {
+            self.push(Ins::ThreadId(k))
+        }
         fn ballot(&mut self, c: u32) -> [u32; 2] {
             [self.push(Ins::Ballot(c, 0)), self.push(Ins::Ballot(c, 1))]
         }
@@ -1186,6 +1290,11 @@ mod tests {
     impl Interp {
         /// Runs the program over `lanes` lanes; `io` in, `res` out. Ballots wait for every lane.
         fn run(&self, lanes: usize, io: &[u32], res: &mut [u32], mem: &mut [u32]) {
+            self.run_with(lanes, 0, [0; 3], io, res, mem)
+        }
+
+        /// One wave of a compute group: its first thread `base`, the group `group`.
+        fn run_with(&self, lanes: usize, base: u32, group: [u32; 3], io: &[u32], res: &mut [u32], mem: &mut [u32]) {
             let mut ls: Vec<LaneState> = (0..lanes).map(|_| LaneState { block: 0, at: 0, from: 0, env: HashMap::new(), done: false }).collect();
             let mut steps = 0usize;
             loop {
@@ -1249,6 +1358,8 @@ mod tests {
                                 Ins::Select(c, a, b) => Some(if g(c) != 0 { g(a) } else { g(b) }),
                                 Ins::Zext(b) => Some(g(b)),
                                 Ins::Lane => Some(lane as u32),
+                                Ins::GroupId(k) => Some(group[*k as usize]),
+                                Ins::ThreadId(k) => Some(if *k == 0 { base + lane as u32 } else { 0 }),
                                 Ins::Ballot(..) => break,
                                 Ins::IoLoad(a) => Some(io[g(a) as usize]),
                                 Ins::MemLoad(a) => Some(mem.get((g(a) / 4) as usize).copied().unwrap_or(0)),
@@ -1365,6 +1476,39 @@ mod tests {
         ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 1), ("DATA", 0), ("SADDR", 125), ("OFFSET", 0x200)]),
         ENDPGM,
     ];
+
+    /// A compute program: 64 threads, user SGPRs s0–s1, the group id x in s2;
+    /// mem[64·group + thread] = 3·thread + s0 + group
+    const COMPUTE: &[I] = &[
+        ("S_MUL_I32", "ENC_SOP2", &[("SDST", 3), ("SSRC0", 2), ("SSRC1", 192)]),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 3), ("VSRC1", 0)]),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 130), ("VSRC1", 2)]),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", V), ("VSRC1", 0)]),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", V + 1), ("VSRC1", 0)]),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 0), ("VSRC1", 1)]),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 2), ("VSRC1", 1)]),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 2), ("DATA", 1), ("SADDR", 125), ("OFFSET", 0)]),
+        ENDPGM,
+    ];
+
+    fn compute_cs() -> crate::gpu::recomp::CsInterface {
+        crate::gpu::recomp::CsInterface { threads: [64, 1, 1], user_sgprs: 2, tgid: [true, false, false], tg_size: false, tid_components: 1 }
+    }
+
+    /// A compute program run on the CPU over `groups` groups (wave32): the memory after.
+    fn run_compute(lines: &[I], cs: &crate::gpu::recomp::CsInterface, groups: u32, sgprs: &[u32], mem: &[u32]) -> Vec<u32> {
+        let ir = lower_compute(&decode(lines), cs, false, Interp::default()).unwrap_or_else(|e| panic!("{e}"));
+        let mut io = vec![0u32; KERNEL_SGPRS];
+        io[..sgprs.len()].copy_from_slice(sgprs);
+        let mut res = vec![0u32; KERNEL_SGPRS];
+        let mut mem = mem.to_vec();
+        for g in 0..groups {
+            for w in 0..cs.threads[0].div_ceil(32) {
+                ir.run_with(32, w * 32, [g, 0, 0], &io, &mut res, &mut mem);
+            }
+        }
+        mem
+    }
 
     fn memory_image() -> Vec<u32> {
         (0..256).map(|i| 1000 + i).collect()
@@ -1532,6 +1676,38 @@ mod tests {
         let insts = decode(MEMORY);
         let sum = lane_masks::analyze(&insts, false).unwrap();
         assert_eq!(sum.guarded.iter().filter(|&&pc| insts.iter().any(|d| d.pc == pc && is_store(d))).count(), 1);
+    }
+
+    #[test]
+    fn a_compute_program_takes_its_group_and_thread_ids() {
+        let mem = run_compute(COMPUTE, &compute_cs(), 3, &[100, 0], &vec![0u32; 256]);
+        for g in 0..3u32 {
+            for t in 0..64u32 {
+                assert_eq!(mem[(64 * g + t) as usize], 3 * t + 100 + g, "group {g} thread {t}");
+            }
+        }
+        // 2-D groups are not lowered yet
+        let cs = crate::gpu::recomp::CsInterface { threads: [8, 8, 1], ..compute_cs() };
+        assert!(lower_compute(&decode(COMPUTE), &cs, false, Interp::default()).is_err());
+    }
+
+    /// The compute program through the HLSL path on the GPU and through the lowering on the CPU.
+    #[test]
+    fn a_compute_program_agrees_with_the_hlsl_path_on_the_gpu() {
+        use super::super::{dxc, runner, translate, Mode, Options};
+        if runner::adapter().is_err() || dxc::location().is_err() {
+            runner::skip_test(if runner::adapter().is_err() { "no GPU" } else { "no DXC" });
+            return;
+        }
+        let bytes: Vec<u8> = COMPUTE.iter().flat_map(|(n, e, f)| rdna2::encode(n, e, f, None).unwrap()).collect();
+        let cs = compute_cs();
+        let t = translate(&bytes, &Options { mode: Mode::Compute(cs.clone()), wave64: false, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+        let mem = vec![0u32; 256];
+        let gpu = runner::dispatch(&dxil, [3, 1, 1], &[100, 0], &mem).unwrap();
+        let cpu = run_compute(COMPUTE, &cs, 3, &[100, 0], &mem);
+        assert_eq!(&gpu[..cpu.len()], &cpu[..]);
     }
 
     #[test]
