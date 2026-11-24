@@ -1068,6 +1068,9 @@ fn lower<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I) -> R<(
         let m = l.read(exit, Var::M(r));
         if r != EXEC && l.stale(exit, m) {
             stale.push(r);
+            if l.wave64 {
+                stale.push(r + 1); // the upper half comes from the same mask
+            }
         }
         let [lo, hi] = l.ir.ballot(m);
         sval.push((r, lo));
@@ -1678,6 +1681,106 @@ pub(crate) mod tests {
                 assert_eq!(cs[r], gpu.sgpr[r], "{name}: s{r}");
             }
             for l in 0..32 {
+                for &r in &vregs {
+                    assert_eq!(cv[l][r], gpu.vgpr[l][r], "{name}: lane {l} v{r}");
+                }
+            }
+        }
+    }
+
+    // wave64 versions of the programs above: 64-bit EXEC / VCC / saved masks, and thresholds
+    // past lane 32 so that both words of every mask matter
+    /// v_cmp_gt_u32 vcc, 40, v0; s_and_saveexec_b64 s[0:1], vcc; s_cbranch_execz L; v_mov v1, 7;
+    /// L: s_or_b64 exec, exec, s[0:1]; v_add v2, v1, 1
+    const SKIPPED_IF_W64: &[I] = &[
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 168), ("VSRC1", 0)]),
+        ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]),
+        ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 1)]),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 135)]),
+        ("S_OR_B64", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 0)]),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 129), ("VSRC1", 1)]),
+        ENDPGM,
+    ];
+    /// s_mov_b64 s[0:1], exec; L: v_add v1, v1, 1; v_cmp_ge_u32 vcc, v1, v0;
+    /// exec &= ~vcc (b64); s_cbranch_execnz L; exec |= s[0:1]  →  v1 = max(1, lane), 64 lanes
+    const LEAVING_LOOP_W64: &[I] = &[
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 126)]),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 129), ("VSRC1", 1)]),
+        ("V_CMP_GE_U32", "ENC_VOPC", &[("SRC0", V + 1), ("VSRC1", 0)]),
+        ("S_ANDN2_B64", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 106)]),
+        ("S_CBRANCH_EXECNZ", "ENC_SOPP", &[("SIMM16", 0xFFFC)]),
+        ("S_OR_B64", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 0)]),
+        ENDPGM,
+    ];
+    /// `MEMORY` over 64 lanes: lanes below 40 take the guarded store
+    const MEMORY_W64: &[I] = &[
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 130), ("VSRC1", 0)]),
+        ("S_LOAD_DWORDX2", "ENC_SMEM", &[("SDATA", 4), ("SBASE", 0), ("OFFSET", 8), ("SOFFSET", 125)]),
+        ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 2), ("ADDR", 1), ("SADDR", 125), ("OFFSET", 0)]),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 4), ("VSRC1", 2)]),
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 168), ("VSRC1", 0)]),
+        ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 6), ("SSRC0", 106)]),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 1), ("DATA", 2), ("SADDR", 125), ("OFFSET", 0x100)]),
+        ("S_OR_B64", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 6)]),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 1), ("DATA", 0), ("SADDR", 125), ("OFFSET", 0x200)]),
+        ENDPGM,
+    ];
+
+    #[test]
+    fn a_wave64_mask_left_behind_is_reported_in_both_halves() {
+        // VCC from the loop's last v_cmp: lanes that left earlier kept their own bits in both words
+        let (_, stale) = lower_kernel(&decode(LEAVING_LOOP_W64), true, Interp::default()).unwrap();
+        assert_eq!(stale, vec![106, 107]);
+    }
+
+    /// The wave64 lowering run on the CPU and the HLSL path's native wave64 form run on a GPU
+    /// with 64-lane waves give the same registers and memory.
+    #[test]
+    fn the_wave64_lowering_agrees_with_the_hlsl_path_on_the_gpu() {
+        use super::super::{dxc, runner, translate, Options};
+        if runner::adapter().is_err() || dxc::location().is_err() {
+            runner::skip_test(if runner::adapter().is_err() { "no GPU" } else { "no DXC" });
+            return;
+        }
+        if runner::wave64_supported() != Ok(true) {
+            runner::skip_test("no wave64");
+            return;
+        }
+        for (name, lines) in [
+            ("straight", STRAIGHT),
+            ("skipped if", SKIPPED_IF_W64),
+            ("leaving loop", LEAVING_LOOP_W64),
+            ("uniform loop", UNIFORM_LOOP),
+            ("memory", MEMORY_W64),
+        ] {
+            let bytes: Vec<u8> = lines.iter().flat_map(|(n, e, f)| rdna2::encode(n, e, f, None).unwrap()).collect();
+            let (s, v) = state(64);
+            let mut st = runner::KernelState::default();
+            st.sgpr.copy_from_slice(&s);
+            for (l, regs) in v.iter().enumerate() {
+                st.vgpr[l][..regs.len()].copy_from_slice(regs);
+            }
+            let t = translate(&bytes, &Options { wave64: true, split_wave64: false, ..Default::default() }).unwrap();
+            assert!(t.complete(), "{name}: {:?}", t.unsupported_why);
+            let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+            let mem = memory_image();
+            let gpu = runner::run(&dxil, &st, &mem).unwrap();
+            let (cs, cv, cmem) = run_mem(lines, true, &s, &v, &mem);
+            assert_eq!(&gpu.mem[..cmem.len()], &cmem[..], "{name}: memory");
+            let insts = decode(lines);
+            let (_, stale) = lower_kernel(&insts, true, Interp::default()).unwrap();
+            let mut sregs: Vec<usize> = vec![106, 107, 126, 127];
+            let mut vregs: Vec<usize> = Vec::new();
+            for d in &insts {
+                let (r, w) = rdna2::sgpr_uses(d);
+                sregs.extend(r.iter().chain(&w).map(|&x| x as usize).filter(|&x| x < 125));
+                let (r, w) = rdna2::vgpr_uses(d);
+                vregs.extend(r.iter().chain(&w).map(|&x| x as usize));
+            }
+            for &r in sregs.iter().filter(|&&r| !stale.contains(&(r as u8))) {
+                assert_eq!(cs[r], gpu.sgpr[r], "{name}: s{r}");
+            }
+            for l in 0..64 {
                 for &r in &vregs {
                     assert_eq!(cv[l][r], gpu.vgpr[l][r], "{name}: lane {l} v{r}");
                 }
