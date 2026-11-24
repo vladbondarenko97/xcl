@@ -2779,6 +2779,40 @@ fn gpu_valu_16_and_64_bit() {
     assert_eq!(r.sgpr[22] as u64 | (r.sgpr[23] as u64) << 32, carries, "v_mad_u64_u32 carry mask");
 }
 
+/// TG_SIZE of a group that is not whole waves (48 threads): its last, partial wave counts
+/// (2 waves of 32, 1 of 64), on the HLSL path and in the direct DXIL translator.
+#[test]
+fn gpu_compute_tg_size_counts_a_partial_wave() {
+    use crate::gpu::dxil::kernel::{translate_compute, KernelOptions};
+    let waves = gpu_waves();
+    if waves.is_empty() {
+        return;
+    }
+    // out[tid] = s3 (TG_SIZE, after the user SGPRs s0..s1 and the group id s2)
+    let p = prog(&[
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 8), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 9), ("SRC0", 128)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 3)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 8), ("DATA", 7), ("SADDR", 125), ("OFFSET", 0)], None),
+    ]);
+    let cs = super::CsInterface { threads: [48, 1, 1], user_sgprs: 2, tgid: [true, false, false], tg_size: true, tid_components: 1 };
+    for wave64 in waves {
+        let lanes = if wave64 { 64 } else { 32 };
+        let opt = Options { mode: Mode::Compute(cs.clone()), wave64, ..Default::default() };
+        let t = translate(&p, &opt).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let hlsl = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+        let o = KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 };
+        let direct = translate_compute(&p, o, &cs).unwrap_or_else(|e| panic!("direct DXIL: {e}")).dxil;
+        for (path, dxil) in [("HLSL", hlsl), ("direct DXIL", direct)] {
+            let out = runner::dispatch(&dxil, [1, 1, 1], &[0, 0], &vec![0u32; 64]).unwrap();
+            for tid in 0..48u32 {
+                assert_eq!(out[tid as usize], 48u32.div_ceil(lanes) | (tid / lanes) << 6, "{path}, wave{lanes}, thread {tid}");
+            }
+        }
+    }
+}
+
 #[test]
 fn gpu_packed_math_dots_movrel() {
     if !gpu_ready() {
