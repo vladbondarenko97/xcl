@@ -37,7 +37,7 @@ pub struct KernelOptions {
 /// Version of the direct translator's output, part of the on-disk translation cache's
 /// identity (`recomp::pso`): bump it on any change that alters the emitted containers
 /// (the `gpu/dxil` sources are not in build.rs's translator source hash).
-pub const TRANSLATOR_VERSION: u32 = 7;
+pub const TRANSLATOR_VERSION: u32 = 8;
 
 /// `XCL_DIRECT_DXIL=1`: console compute shaders (and the kernel tests) go through this
 /// translator, with the HLSL path as the fallback for what it cannot translate yet.
@@ -568,8 +568,8 @@ pub fn compute_init(lw: &mut Lw, cs: &CsInterface, tid: Value, gtid: [Value; 3])
     let lanes: u32 = if lw.wave64 { 64 } else { 32 };
     let total: u32 = cs.threads.iter().product();
     if cs.tg_size {
-        // (threads / lanes) | (gi / lanes) << 6
-        let w = lw.c(total / lanes);
+        // waves in the group (a last, partial wave counts) | (gi / lanes) << 6
+        let w = lw.c(total.div_ceil(lanes));
         let l = lw.c(lanes);
         let i = lw.bin(super::module::BinOp::UDiv, tid, l);
         let i = lw.shlc(i, 6);
