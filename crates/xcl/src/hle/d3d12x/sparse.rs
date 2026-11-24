@@ -37,6 +37,8 @@ const POOL_TILES: u32 = 1024;
 /// tiles decommitted while no title work was submitted that stay mapped (`State::parked`) before
 /// they are unmapped together: 256 MB of video memory
 const PARKED_MAX: usize = 4096;
+/// tiles waiting for their mapping call (`State::pending`) before they are sent at once: 256 MB
+const PENDING_MAX: usize = 4096;
 /// bytes of the ring-buffered upload staging buffer
 const STAGING: usize = 64 << 20;
 /// alignment of sub-allocations inside the upload staging ring (write-combined cacheline)
@@ -225,6 +227,12 @@ struct State {
     /// decommits and commits again thousands of tiles a second, and each `UpdateTileMappings`
     /// took ~0.15 ms.)
     parked: FxHashMap<usize, (u32, u32)>,
+    /// tile addresses given a pool tile in `mapped` whose `UpdateTileMappings` has not been sent
+    /// yet: mapped together (`flush_pending`, one call per window) before the next title submit,
+    /// before XCL's own GPU work on the windows, or past `PENDING_MAX`. (A retail title starting
+    /// on a Series S profile maps 4.3 GB of physical pages in small pieces: one mapping call
+    /// each, ~0.4 ms, held its loading thread ~25 s and its stall watchdog ended it.)
+    pending: Vec<usize>,
     /// placed buffers → `(registration id, the pool tiles they use)`
     buffers: FxHashMap<usize, (u64, Vec<(u32, u32)>)>,
     /// reused tiles / decommitted partial pages to clear: (address, bytes)
@@ -578,6 +586,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             mapped: FxHashMap::default(),
             pinned: FxHashMap::default(),
             parked: FxHashMap::default(),
+            pending: Vec::new(),
             buffers: FxHashMap::default(),
             to_zero: Vec::new(),
             staging: None,
@@ -828,7 +837,7 @@ impl State {
         }
         let first = a & !(TILE - 1);
         let end = a.saturating_add(n);
-        let mut new: Vec<(usize, (u32, u32))> = Vec::new();
+        let mut new = false;
         let mut unparked = false;
         let mut t = first;
         while t < end {
@@ -846,7 +855,8 @@ impl State {
                     if reused {
                         self.to_zero.push((t, TILE));
                     }
-                    new.push((t, tile));
+                    self.pending.push(t);
+                    new = true;
                 }
             }
             match t.checked_add(TILE) {
@@ -854,19 +864,36 @@ impl State {
                 None => break,
             }
         }
-        if new.is_empty() {
-            if unparked {
-                MAPPED_GEN.fetch_add(1, Ordering::Release);
-            }
+        if new || unparked {
+            MAPPED_GEN.fetch_add(1, Ordering::Release);
+        }
+        if self.pending.len() >= PENDING_MAX {
+            self.flush_pending();
+        }
+    }
+
+    /// The pending tiles (`pending`) mapped onto their pool tiles, one call per window, then the
+    /// fence signalled (title queues wait for it in `before_execute`). An address decommitted
+    /// since has no `mapped` entry and is skipped; one committed again maps its current tile. One
+    /// decommitted and parked stays pending: its mapping was never sent, and a commit that takes it
+    /// back from `parked` sends none.
+    unsafe fn flush_pending(&mut self) {
+        if self.pending.is_empty() {
             return;
         }
-        MAPPED_GEN.fetch_add(1, Ordering::Release);
-        // per window
+        let mut addrs = std::mem::take(&mut self.pending);
+        addrs.sort_unstable();
+        addrs.dedup();
         let mut by_window: FxHashMap<usize, Vec<(usize, (u32, u32))>> = FxHashMap::default();
-        for x in new {
-            if let Some(wi) = self.window_index(x.0) {
-                by_window.entry(wi).or_default().push(x);
+        for t in addrs {
+            if let (Some(e), Some(wi)) = (self.mapped.get(&t), self.window_index(t)) {
+                by_window.entry(wi).or_default().push((t, e.pool));
+            } else if self.parked.contains_key(&t) {
+                self.pending.push(t);
             }
+        }
+        if by_window.is_empty() {
+            return;
         }
         for (wi, tiles) in by_window {
             let (b, r) = (self.windows[wi].0, self.windows[wi].1.clone());
@@ -928,6 +955,8 @@ impl State {
     /// Close and submit upload slot `idx` asynchronously (NO CPU wait — callers order GPU work
     /// via `queue.Wait(&self.fence, self.value)`).
     unsafe fn submit_slot(&mut self, idx: usize) {
+        // the copies on `queue` see every tile mapped (`pending` goes first on the same queue)
+        self.flush_pending();
         let closed = self.slots[idx].list.Close().is_ok();
         if closed {
             if let Ok(l) = self.slots[idx].list.cast::<ID3D12CommandList>() {
@@ -1148,6 +1177,7 @@ impl State {
     /// Copy `ranges` (address, bytes) from sparse VRAM back into the CPU view and refresh
     /// `sent` hashes. Caller has already ordered `self.queue` after any GPU writes if needed.
     unsafe fn readback_ranges(&mut self, ranges: &[(usize, usize)]) {
+        self.flush_pending();
         let Some((rb, p)) = self.readback_buf() else { return };
         let mut pending: Vec<(usize, usize, usize)> = Vec::new(); // (va, rb_off, chunk)
         let mut used = 0usize;
@@ -1826,6 +1856,8 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     let mut g = STATE.lock().unwrap();
     let Some(s) = g.as_mut() else { return };
     s.drain_forgotten();
+    // the title's work sees what was committed mapped …
+    s.flush_pending();
     // the title's work sees what was decommitted unmapped, as it was
     if s.flush_parked() {
         s.retire_free_pools();
@@ -2240,6 +2272,7 @@ mod tests {
                 free: Vec::new(),
                 retired: Vec::new(),
                 parked: FxHashMap::default(),
+                pending: Vec::new(),
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
                 buffers: FxHashMap::default(),
@@ -2446,6 +2479,7 @@ mod tests {
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
                 parked: FxHashMap::default(),
+                pending: Vec::new(),
                 buffers: FxHashMap::default(),
                 to_zero: Vec::new(),
                 staging: None,
@@ -2539,6 +2573,7 @@ mod tests {
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
                 parked: FxHashMap::default(),
+                pending: Vec::new(),
                 buffers: FxHashMap::default(),
                 to_zero: Vec::new(),
                 staging: None,
@@ -2560,6 +2595,10 @@ mod tests {
 
             s.commit_range(base, TILE);
             let tile = s.mapped[&base].pool;
+            assert_eq!(s.pending, vec![base], "a new tile's mapping waits for the next flush");
+            assert_eq!(s.value, 0, "nothing sent yet");
+            s.flush_pending();
+            assert!(s.pending.is_empty());
             let v = s.value;
             assert!(v > 0, "a new tile is mapped");
 
@@ -2600,6 +2639,22 @@ mod tests {
             assert!(s.parked.is_empty());
             assert_eq!(s.mapped[&(base + TILE)].pool, tile);
             assert!(!s.mapped.contains_key(&base));
+
+            // committed and decommitted again before a flush: no mapping is sent for it
+            s.flush_pending();
+            s.flush_parked();
+            let v = s.value;
+            s.commit_range(base, TILE);
+            assert_eq!(s.pending, vec![base]);
+            s.decommit_range(base, TILE);
+            s.flush_pending(); // as for an upload or readback before the title's next submit
+            assert_eq!(s.value, v, "a tile gone before the flush is not mapped");
+            assert_eq!(s.pending, vec![base], "parked, its mapping never sent: still pending");
+            // taken back from `parked`: the flush now sends its mapping
+            s.commit_range(base, TILE);
+            s.flush_pending();
+            assert!(s.pending.is_empty());
+            assert!(s.value > v, "a tile parked before its mapping was sent is mapped");
 
             s.wait_for(s.value);
             drop(s);
