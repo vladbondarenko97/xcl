@@ -386,6 +386,22 @@ mod tests {
     /// form refuses a program, that half is SKIPPED with the refusal.
     #[test]
     fn f32_programs_on_the_gpu() {
+        programs_on_the_gpu(&[
+            ("f32 arithmetic", F32_ARITHMETIC, check_f32_arithmetic, &[]),
+            ("f32 compares", F32_COMPARES, check_f32_compares, &[]),
+            ("f32 conversions", F32_CONVERSIONS, check_f32_conversions, &[]),
+            ("f32 rounding", F32_ROUNDING, check_f32_rounding, &[]),
+            ("f32 transcendentals", F32_TRANSCENDENTALS, check_f32_transcendentals, &[3, 4]),
+            ("f32 three-source", F32_THREE_SOURCE, check_f32_three_source, &[]),
+        ]);
+    }
+
+    /// A program of `lower`'s tests, the check of its registers on the HLSL path (wave32), and
+    /// the VGPRs the per-lane form need only match within `f32_close`.
+    type Program = (&'static str, &'static [I], fn(&[u32], &[Vec<u32>]), &'static [usize]);
+
+    /// `f32_programs_on_the_gpu`'s two halves, for any programs.
+    fn programs_on_the_gpu(programs: &[Program]) {
         if !gpu() {
             return;
         }
@@ -393,17 +409,8 @@ mod tests {
             runner::skip_test("no DXC");
             return;
         }
-        type Check = fn(&[u32], &[Vec<u32>]);
-        let programs: [(&str, &[I], Check, &[usize]); 6] = [
-            ("f32 arithmetic", F32_ARITHMETIC, check_f32_arithmetic, &[]),
-            ("f32 compares", F32_COMPARES, check_f32_compares, &[]),
-            ("f32 conversions", F32_CONVERSIONS, check_f32_conversions, &[]),
-            ("f32 rounding", F32_ROUNDING, check_f32_rounding, &[]),
-            ("f32 transcendentals", F32_TRANSCENDENTALS, check_f32_transcendentals, &[3, 4]),
-            ("f32 three-source", F32_THREE_SOURCE, check_f32_three_source, &[]),
-        ];
         let wave64 = runner::wave64_supported() == Ok(true);
-        for (name, lines, check, approx) in programs {
+        for &(name, lines, check, approx) in programs {
             for w64 in [false, true] {
                 let lanes = if w64 { 64 } else { 32 };
                 if w64 && !wave64 {
@@ -481,6 +488,12 @@ mod tests {
                 assert_eq!(&gpu[..128], &cpu[..128], "{threads:?} wave64 {wave64}");
             }
         }
+    }
+
+    /// The f64 program of `lower`'s tests, as `f32_programs_on_the_gpu`.
+    #[test]
+    fn f64_programs_on_the_gpu() {
+        programs_on_the_gpu(&[("f64", F64_ARITHMETIC, check_f64, &[])]);
     }
 
     #[test]

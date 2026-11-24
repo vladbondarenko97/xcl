@@ -2314,6 +2314,114 @@ pub(crate) mod tests {
         (0..256).map(|i| 1000 + i).collect()
     }
 
+    // f64 programs, as the f32 ones: `lower_dxil`'s `f64_programs_on_the_gpu` checks the HLSL
+    // path's registers with `check_f64` and compares the per-lane form with it
+
+    /// f64 on x = 1 + lane / 32 + lane · 2^-52 (v[2:3]): x + 2^-53 (ties to even), x · 2^-1040
+    /// (a denormal in and out), x · f64::MAX (∞ from lane 1), fma(x, x, −x · x) (the rounding
+    /// error: nonzero only fused), NaN into min / max, VOP3 abs / neg / omod / clamp; floor / ceil
+    /// / trunc / rndne / fract / frexp of q = (lane − 16) / 4 (ties, −0 at lane 15); f64 ↔ f32 /
+    /// i32 / u32 (a tie, overflow, saturation, NaN); rcp / rsq / sqrt.
+    pub(crate) const F64_ARITHMETIC: &[I] = &[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", V)]),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 143), ("VSRC1", 0)]),
+        ("V_OR_B32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 255), ("VSRC1", 3), ("LITERAL", 0x3FF0_0000)]),
+        // v[4:5] = 2^-53, v[6:7] = 2^-1040, v[8:9] = f64::MAX, v[10:11] = NaN
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 128)]),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 255), ("LITERAL", 0x3CA0_0000)]),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 128)]),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 132)]),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 8), ("SRC0", 193)]),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 9), ("SRC0", 255), ("LITERAL", 0x7FEF_FFFF)]),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 10), ("SRC0", 129)]),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 11), ("SRC0", 255), ("LITERAL", 0x7FF8_0000)]),
+        ("V_ADD_F64", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 2), ("SRC1", V + 4)]),
+        ("V_MUL_F64", "ENC_VOP3", &[("VDST", 14), ("SRC0", V + 2), ("SRC1", V + 6)]),
+        ("V_MUL_F64", "ENC_VOP3", &[("VDST", 16), ("SRC0", V + 2), ("SRC1", V + 8)]),
+        ("V_MUL_F64", "ENC_VOP3", &[("VDST", 18), ("SRC0", V + 2), ("SRC1", V + 2)]),
+        ("V_FMA_F64", "ENC_VOP3", &[("VDST", 20), ("SRC0", V + 2), ("SRC1", V + 2), ("SRC2", V + 18), ("NEG", 4)]),
+        ("V_MIN_F64", "ENC_VOP3", &[("VDST", 22), ("SRC0", V + 10), ("SRC1", V + 2)]),
+        ("V_MAX_F64", "ENC_VOP3", &[("VDST", 24), ("SRC0", V + 2), ("SRC1", V + 10), ("NEG", 2)]),
+        // −x · |−4|, (x − 1) · 4, clamp(fma(x, x, −1))
+        ("V_MUL_F64", "ENC_VOP3", &[("VDST", 26), ("SRC0", V + 2), ("SRC1", 247), ("ABS", 2), ("NEG", 1)]),
+        ("V_ADD_F64", "ENC_VOP3", &[("VDST", 28), ("SRC0", V + 2), ("SRC1", 243), ("OMOD", 2)]),
+        ("V_FMA_F64", "ENC_VOP3", &[("VDST", 30), ("SRC0", V + 2), ("SRC1", V + 2), ("SRC2", 243), ("CLAMP", 1)]),
+        // q = ldexp(lane − 16, −2)
+        ("V_SUBREV_NC_U32", "ENC_VOP2", &[("VDST", 32), ("SRC0", 144), ("VSRC1", 0)]),
+        ("V_CVT_F64_I32", "ENC_VOP1", &[("VDST", 34), ("SRC0", V + 32)]),
+        ("V_LDEXP_F64", "ENC_VOP3", &[("VDST", 36), ("SRC0", V + 34), ("SRC1", 194)]),
+        ("V_FLOOR_F64", "ENC_VOP1", &[("VDST", 38), ("SRC0", V + 36)]),
+        ("V_CEIL_F64", "ENC_VOP1", &[("VDST", 40), ("SRC0", V + 36)]),
+        ("V_TRUNC_F64", "ENC_VOP1", &[("VDST", 42), ("SRC0", V + 36)]),
+        ("V_RNDNE_F64", "ENC_VOP1", &[("VDST", 44), ("SRC0", V + 36)]),
+        ("V_FRACT_F64", "ENC_VOP1", &[("VDST", 46), ("SRC0", V + 36)]),
+        ("V_FREXP_MANT_F64", "ENC_VOP1", &[("VDST", 48), ("SRC0", V + 36)]),
+        ("V_FREXP_EXP_I32_F64", "ENC_VOP1", &[("VDST", 50), ("SRC0", V + 36)]),
+        // f32 of z = 1 + 2^-24 + lane · 2^-52 (a tie at lane 0) and of f64::MAX; i32 of −4x, of
+        // x · f64::MAX and of NaN, u32 of −4x and of NaN
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 52), ("SRC0", 255), ("VSRC1", 0), ("LITERAL", 0x1000_0000)]),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 53), ("SRC0", 255), ("LITERAL", 0x3FF0_0000)]),
+        ("V_CVT_F32_F64", "ENC_VOP1", &[("VDST", 51), ("SRC0", V + 52)]),
+        ("V_CVT_F32_F64", "ENC_VOP1", &[("VDST", 54), ("SRC0", V + 8)]),
+        ("V_CVT_I32_F64", "ENC_VOP1", &[("VDST", 55), ("SRC0", V + 26)]),
+        ("V_CVT_I32_F64", "ENC_VOP1", &[("VDST", 56), ("SRC0", V + 16)]),
+        ("V_CVT_I32_F64", "ENC_VOP1", &[("VDST", 57), ("SRC0", V + 10)]),
+        ("V_CVT_U32_F64", "ENC_VOP1", &[("VDST", 58), ("SRC0", V + 26)]),
+        ("V_CVT_U32_F64", "ENC_VOP1", &[("VDST", 59), ("SRC0", V + 10)]),
+        // f64 of u32::MAX − lane and of the f32 at v51
+        ("V_SUB_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 193), ("VSRC1", 0)]),
+        ("V_CVT_F64_U32", "ENC_VOP1", &[("VDST", 60), ("SRC0", V + 1)]),
+        ("V_CVT_F64_F32", "ENC_VOP1", &[("VDST", 62), ("SRC0", V + 51)]),
+        ("V_RCP_F64", "ENC_VOP1", &[("VDST", 64), ("SRC0", V + 2)]),
+        ("V_RSQ_F64", "ENC_VOP1", &[("VDST", 66), ("SRC0", V + 2)]),
+        ("V_SQRT_F64", "ENC_VOP1", &[("VDST", 68), ("SRC0", V + 2)]),
+        ENDPGM,
+    ];
+
+    pub(crate) fn check_f64(_: &[u32], v: &[Vec<u32>]) {
+        for (l, r) in v.iter().enumerate() {
+            let f = |i: usize| f64::from_bits(r[i] as u64 | (r[i + 1] as u64) << 32);
+            let x = 1.0 + l as f64 / 32.0 + l as f64 * 2f64.powi(-52);
+            let q = (l as f64 - 16.0) / 4.0;
+            assert_eq!(f(2).to_bits(), x.to_bits(), "lane {l}");
+            let p = x * x;
+            let e = if q == 0.0 { 0 } else { (q.abs().to_bits() >> 52) as i32 - 1022 };
+            let want = [
+                x + 2f64.powi(-53),
+                x * 2f64.powi(-1040),
+                x * f64::MAX,
+                p,
+                x.mul_add(x, -p),
+                x,
+                x,
+                -4.0 * x,
+                (x - 1.0) * 4.0,
+                x.mul_add(x, -1.0).clamp(0.0, 1.0),
+                (l as f64 - 16.0),
+                q,
+                q.floor(),
+                q.ceil(),
+                q.trunc(),
+                q.round_ties_even(),
+                q - q.floor(),
+                q / 2f64.powi(e),
+            ];
+            for (k, w) in want.iter().enumerate() {
+                let i = 12 + 2 * k + if k >= 10 { 2 } else { 0 };
+                assert_eq!(f(i).to_bits(), w.to_bits(), "lane {l} v[{i}:{}]: {} against {w}", i + 1, f(i));
+            }
+            assert_eq!(r[50], e as u32, "lane {l}: frexp_exp");
+            let z = 1.0 + 2f64.powi(-24) + l as f64 * 2f64.powi(-52);
+            assert_eq!([r[51], r[54]], [(z as f32).to_bits(), f32::INFINITY.to_bits()], "lane {l}: f32 of f64");
+            assert_eq!([r[55], r[56], r[57], r[58], r[59]], [(-4.0 * x) as i32 as u32, i32::MAX as u32, 0, 0, 0], "lane {l}: i32 / u32 of f64");
+            assert_eq!([f(60), f(62)], [(u32::MAX - l as u32) as f64, z as f32 as f64], "lane {l}: f64 of u32, f32");
+            // the GPU's rcp / rsq / sqrt are close, not exact
+            for (i, w) in [(64, 1.0 / x), (66, 1.0 / x.sqrt()), (68, x.sqrt())] {
+                assert!((f(i) - w).abs() <= w * 1e-12, "lane {l} v[{i}:{}]: {} against {w}", i + 1, f(i));
+            }
+        }
+    }
+
     /// A line's bytes; a `("LITERAL", k)` field is the instruction's literal dword.
     pub(crate) fn encode_line((n, e, f): &I) -> Vec<u8> {
         let lit = f.iter().find(|(k, _)| *k == "LITERAL").map(|&(_, v)| v as u32);
