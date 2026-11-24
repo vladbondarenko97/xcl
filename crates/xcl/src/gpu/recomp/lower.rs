@@ -140,6 +140,7 @@ impl<'a, I: Ir> Lower<'a, I> {
             return Err(format!("s{r}: a mask read as a number"));
         }
         self.num_uses.push(v);
+        self.lane_uses.push((b, v));
         Ok(v)
     }
 
@@ -172,7 +173,21 @@ impl<'a, I: Ir> Lower<'a, I> {
         Ok(self.ir.icmp(Cmp::Ne, bit, zero))
     }
 
+    /// SCC, written and read like an SGPR number: a lane that skipped the block writing it
+    /// keeps its own older value (`stale`).
+    fn write_scc(&mut self, b: usize, v: I::V) {
+        self.def_block.entry(v).or_insert(b);
+        self.ssa.write(b, Var::Scc, v);
+    }
+
+    fn read_scc(&mut self, b: usize) -> I::V {
+        let v = self.read(b, Var::Scc);
+        self.lane_uses.push((b, v));
+        v
+    }
+
     fn write_num(&mut self, b: usize, r: u8, v: I::V) {
+        self.def_block.entry(v).or_insert(b);
         self.ssa.write(b, Var::S(r), v);
         self.ssa.write(b, Var::M(r), self.bit_marker);
         if self.wave64 && r > 0 {
@@ -211,7 +226,7 @@ impl<'a, I: Ir> Lower<'a, I> {
             240..=247 => self.ir.int([0.5f32, -0.5, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0][(code - 240) as usize].to_bits()),
             248 => self.ir.int(0x3E22_F983),
             253 => {
-                let s = self.read(b, Var::Scc);
+                let s = self.read_scc(b);
                 self.ir.zext(s)
             }
             255 => self.ir.int(d.literal.ok_or("missing literal")?),
@@ -291,7 +306,9 @@ impl<'a, I: Ir> Lower<'a, I> {
         if let Some(base) = name.strip_suffix(width) {
             let op = base.trim_start_matches("S_");
             let saveexec = op.strip_suffix("_SAVEEXEC").or_else(|| op.strip_suffix("_WREXEC"));
-            let reads_mask = [s0, s1].iter().any(|&c| c <= 127 && c != 124 && self.holds_mask(b, c as u8));
+            // SOP1 has no SSRC1: only the sources the encoding has
+            let srcs: Vec<u64> = std::iter::once(s0).chain(d.enc.field("SSRC1").map(|_| s1)).collect();
+            let reads_mask = srcs.iter().any(|&c| c <= 127 && c != 124 && self.holds_mask(b, c as u8));
             let bitwise = matches!(op, "MOV" | "NOT" | "AND" | "OR" | "XOR" | "ANDN2" | "ORN2" | "NAND" | "NOR" | "XNOR");
             if let Some(op) = saveexec {
                 let a = self.src_bit(b, s0)?;
@@ -301,7 +318,7 @@ impl<'a, I: Ir> Lower<'a, I> {
                 if sd != 125 {
                     self.write_bit(b, sd, if base.ends_with("_WREXEC") { new } else { old });
                 }
-                self.ssa.write(b, Var::Scc, new);
+                self.write_scc(b, new);
                 return Ok(());
             }
             if bitwise && (sd == EXEC || reads_mask) {
@@ -316,7 +333,7 @@ impl<'a, I: Ir> Lower<'a, I> {
                 };
                 self.write_bit(b, sd, v);
                 if op != "MOV" {
-                    self.ssa.write(b, Var::Scc, v);
+                    self.write_scc(b, v);
                 }
                 return Ok(());
             }
@@ -327,7 +344,7 @@ impl<'a, I: Ir> Lower<'a, I> {
             let (a, c) = (self.src_bit(b, s0)?, self.src_bit(b, s1)?);
             let x = self.ir.bin(Bin::Xor, a, c);
             let v = if name == cmp64[0] { self.not(x) } else { x };
-            self.ssa.write(b, Var::Scc, v);
+            self.write_scc(b, v);
             return Ok(());
         }
         // numbers
@@ -360,7 +377,7 @@ impl<'a, I: Ir> Lower<'a, I> {
                 // carry out: the sum wrapped below a; borrow: a < b
                 let scc = if carry { self.ir.icmp(Cmp::Ult, v, a) } else { self.ir.icmp(Cmp::Ult, a, c) };
                 self.write_num(b, sd, v);
-                self.ssa.write(b, Var::Scc, scc);
+                self.write_scc(b, scc);
             }
             "S_ADD_I32" | "S_SUB_I32" => {
                 let (a, c) = (self.src(b, d, s0)?, self.src(b, d, s1)?);
@@ -377,7 +394,7 @@ impl<'a, I: Ir> Lower<'a, I> {
                 let z = self.ir.int(0);
                 let scc = self.ir.icmp(Cmp::Slt, both, z);
                 self.write_num(b, sd, v);
-                self.ssa.write(b, Var::Scc, scc);
+                self.write_scc(b, scc);
             }
             "S_MUL_I32" => {
                 let v = num2(self, Bin::Mul)?;
@@ -392,7 +409,7 @@ impl<'a, I: Ir> Lower<'a, I> {
                 let v = num2(self, op)?;
                 let scc = nonzero(self, v);
                 self.write_num(b, sd, v);
-                self.ssa.write(b, Var::Scc, scc);
+                self.write_scc(b, scc);
             }
             "S_LSHL_B32" | "S_LSHR_B32" | "S_ASHR_I32" => {
                 let (a, c) = (self.src(b, d, s0)?, self.src(b, d, s1)?);
@@ -406,7 +423,7 @@ impl<'a, I: Ir> Lower<'a, I> {
                 let v = self.ir.bin(op, a, sh);
                 let scc = nonzero(self, v);
                 self.write_num(b, sd, v);
-                self.ssa.write(b, Var::Scc, scc);
+                self.write_scc(b, scc);
             }
             n if n.starts_with("S_CMP_") && (n.ends_with("_U32") || n.ends_with("_I32")) => {
                 let (a, c) = (self.src(b, d, s0)?, self.src(b, d, s1)?);
@@ -421,7 +438,7 @@ impl<'a, I: Ir> Lower<'a, I> {
                     _ => return Err(format!("unsupported {n}")),
                 };
                 let v = self.ir.icmp(p, a, c);
-                self.ssa.write(b, Var::Scc, v);
+                self.write_scc(b, v);
             }
             "S_NOP" | "S_WAITCNT" | "S_WAITCNT_VSCNT" | "S_WAITCNT_VMCNT" | "S_WAITCNT_LGKMCNT" | "S_WAITCNT_EXPCNT" | "S_INST_PREFETCH" | "S_CLAUSE" => {}
             n => return Err(format!("unsupported {n}")),
@@ -447,7 +464,7 @@ impl<'a, I: Ir> Lower<'a, I> {
         }
         let fv = |f: &str| rdna2::field_value(d.enc, &d.words, f);
         let vop3 = d.enc.name.starts_with("ENC_VOP3") || d.enc.name.starts_with("VOP3");
-        if vop3 && ["ABS", "NEG", "CLAMP", "OMOD", "OPSEL"].iter().any(|f| fv(f).unwrap_or(0) != 0) {
+        if vop3 && ["ABS", "NEG", "CLAMP", "OMOD", "OP_SEL"].iter().any(|f| fv(f).unwrap_or(0) != 0) {
             return Err(format!("{name}: VOP3 modifiers"));
         }
         // sources: VOP1 / VOP2 / VOPC put src1 in VSRC1 (a VGPR); VOP3 in SRC1
@@ -608,9 +625,9 @@ impl<'a, I: Ir> Lower<'a, I> {
     /// The condition under which a lane takes the branch ending block b.
     fn cond(&mut self, b: usize, d: &Decoded) -> R<I::V> {
         Ok(match d.inst.name {
-            "S_CBRANCH_SCC1" => self.read(b, Var::Scc),
+            "S_CBRANCH_SCC1" => self.read_scc(b),
             "S_CBRANCH_SCC0" => {
-                let s = self.read(b, Var::Scc);
+                let s = self.read_scc(b);
                 self.not(s)
             }
             n @ ("S_CBRANCH_VCCZ" | "S_CBRANCH_VCCNZ") => {
@@ -1035,6 +1052,9 @@ fn lower<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I) -> R<(
         let s = l.read(exit, Var::S(r));
         if l.ssa.resolve_value(s) != l.num_marker && !l.reaches(s, l.num_marker) {
             l.num_uses.push(s);
+            if l.stale(exit, s) {
+                stale.push(r);
+            }
             sval.push((r, s));
             continue;
         }
@@ -1060,6 +1080,9 @@ fn lower<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I) -> R<(
         }
     }
     let scc = l.read(exit, Var::Scc);
+    if l.stale(exit, scc) {
+        stale.push(KERNEL_SCC_SLOT as u8);
+    }
     let vval: Vec<(u16, I::V)> = vregs.iter().map(|&v| (v, l.read(exit, Var::V(v)))).collect();
     let z = l.ir.int(0);
     let first = l.ir.icmp(Cmp::Eq, lane, z);
@@ -1101,7 +1124,7 @@ impl<I: Ir> Lower<'_, I> {
         }
         for &(c, v) in &self.lane_uses {
             if self.stale(c, v) {
-                return Err("a mask written while some lanes were elsewhere, read after they met again".into());
+                return Err("a value written while some lanes were elsewhere, read after they met again".into());
             }
         }
         stale.sort_unstable();
@@ -1725,6 +1748,40 @@ pub(crate) mod tests {
         // a mask written before the lanes split is read after they meet: fine
         let insts = decode(SKIPPED_IF);
         assert_eq!(lower_kernel(&insts, false, Interp::default()).unwrap().1, Vec::<u8>::new());
+    }
+
+    #[test]
+    fn a_scalar_counted_in_a_loop_lanes_leave_is_not_each_lanes_own() {
+        // s_add_u32 s1, s1, 1 in the loop lanes leave one by one: the console counts the wave's
+        // passes, each lane here only its own (a waterfall loop's key is the same case)
+        // s_mov s0, exec; s1 = 0; L: v_add v1, v1, 1; s1 += 1; v_cmp_ge vcc, v1, v0;
+        // exec &= ~vcc; s_cbranch_execnz L; exec |= s0
+        let mut lines: Vec<I> = vec![
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 126)]),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 1), ("SSRC0", 128)]),
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 129), ("VSRC1", 1)]),
+            ("S_ADD_U32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 1), ("SSRC1", 129)]),
+            ("V_CMP_GE_U32", "ENC_VOPC", &[("SRC0", V + 1), ("VSRC1", 0)]),
+            ("S_ANDN2_B32", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 106)]),
+            ("S_CBRANCH_EXECNZ", "ENC_SOPP", &[("SIMM16", 0xFFFB)]),
+            ("S_OR_B32", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 0)]),
+            ENDPGM,
+        ];
+        let (_, stale) = lower_kernel(&decode(&lines), false, Interp::default()).unwrap();
+        assert!(stale.contains(&1), "{stale:?}");
+        // read after the loop: refused
+        lines.insert(8, ("S_MOV_B32", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 1)]));
+        let err = lower_kernel(&decode(&lines), false, Interp::default()).err().expect("refused");
+        assert!(err.contains("some lanes were elsewhere"), "{err}");
+    }
+
+    #[test]
+    fn vop3_operand_selects_are_refused() {
+        let op_sel: &[I] = &[("V_ADD_NC_U32", "ENC_VOP3", &[("VDST", 1), ("SRC0", V), ("SRC1", V), ("OP_SEL", 1)]), ENDPGM];
+        let err = lower_kernel(&decode(op_sel), false, Interp::default()).err().expect("refused");
+        assert!(err.contains("modifiers"), "{err}");
+        let plain: &[I] = &[("V_ADD_NC_U32", "ENC_VOP3", &[("VDST", 1), ("SRC0", V), ("SRC1", V)]), ENDPGM];
+        assert!(lower_kernel(&decode(plain), false, Interp::default()).is_ok());
     }
 
     #[test]
