@@ -63,6 +63,15 @@ pub enum FBin {
     Max,
 }
 
+/// Conversions between i32 / u32 and f32 (round to nearest even; out of range is the caller's)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Cvt {
+    SiToF,
+    UiToF,
+    FToSi,
+    FToUi,
+}
+
 /// Ordered f32 compares (false when either operand is NaN)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FCmp {
@@ -73,12 +82,15 @@ pub enum FCmp {
     Ge,
 }
 
-/// `Abs` and `Neg` as HLSL's `abs` / `-x`; `Sat` is `saturate` (NaN gives 0)
+/// `Abs` and `Neg` as HLSL's `abs` / `-x`; `Sat` is `saturate` (NaN gives 0); `Floor` is
+/// `floor`; `F16ToF32` is `f16tof32` of the dword's low 16 bits
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FUn {
     Abs,
     Neg,
     Sat,
+    Floor,
+    F16ToF32,
 }
 
 /// What the lowering needs from the DXIL module builder. Blocks are numbered in the order
@@ -115,6 +127,7 @@ pub trait Ir: Sink {
     fn fun(&mut self, op: FUn, a: Self::V) -> Self::V;
     /// HLSL's `mad` (DXIL `FMad`): fused or not, as the driver chooses
     fn fmad(&mut self, a: Self::V, b: Self::V, c: Self::V) -> Self::V;
+    fn cvt(&mut self, c: Cvt, a: Self::V) -> Self::V;
     /// `i1`: an ordered compare of the dwords as f32; whether a dword is a NaN
     fn fcmp(&mut self, c: FCmp, a: Self::V, b: Self::V) -> Self::V;
     fn is_nan(&mut self, a: Self::V) -> Self::V;
@@ -132,7 +145,10 @@ pub trait Ir: Sink {
 const EXEC: u8 = 126;
 
 /// The f32 arithmetic `f32_arith` lowers.
-const F32_ARITH: &[&str] = &["V_ADD_F32", "V_SUB_F32", "V_SUBREV_F32", "V_MUL_F32", "V_MIN_F32", "V_MAX_F32", "V_FMA_F32", "V_MAD_F32", "V_MAC_F32", "V_FMAC_F32"];
+const F32_ARITH: &[&str] = &[
+    "V_ADD_F32", "V_SUB_F32", "V_SUBREV_F32", "V_MUL_F32", "V_MIN_F32", "V_MAX_F32", "V_FMA_F32", "V_MAD_F32", "V_MAC_F32", "V_FMAC_F32",
+    "V_CVT_F32_I32", "V_CVT_F32_U32", "V_CVT_U32_F32", "V_CVT_I32_F32", "V_CVT_RPI_I32_F32", "V_CVT_FLR_I32_F32", "V_CVT_F32_F16", "V_CVT_F16_F32",
+];
 const VCC: u8 = 106;
 
 /// The program's stage: where its registers come from and go.
@@ -164,6 +180,8 @@ struct Lower<'a, I: Ir> {
     /// the IR block each mask bit was written in, and the mask bits read (block, value)
     def_block: std::collections::HashMap<I::V, usize>,
     lane_uses: Vec<(usize, I::V)>,
+    /// the program writes MODE (`s_setreg*` of HW_REG_MODE)
+    sets_mode: bool,
     /// a DPP instruction's first source, read from its source lane, and its write enable
     dpp_src: Option<I::V>,
     dpp_en: Option<I::V>,
@@ -510,7 +528,8 @@ impl<'a, I: Ir> Lower<'a, I> {
             }
             "S_NOP" | "S_WAITCNT" | "S_WAITCNT_VSCNT" | "S_WAITCNT_VMCNT" | "S_WAITCNT_LGKMCNT" | "S_WAITCNT_EXPCNT" | "S_INST_PREFETCH" | "S_CLAUSE" => {}
             // MODE (float rounding / denormals): the f32 ops lowered so far ignore it, as the
-            // HLSL path does for f32 (it follows MODE only for f16 / f64 rounding)
+            // HLSL path does for f32 (it follows MODE only for f16 / f64 rounding); the one f16
+            // rounding op lowered, v_cvt_f16_f32, is refused in a program that writes MODE
             "S_SETREG_IMM32_B32" | "S_SETREG_B32" if self.sets_mode_only(d) => {}
             "S_SETREG_IMM32_B32" | "S_SETREG_B32" => {
                 let s = fv("SIMM16").unwrap_or(0);
@@ -556,7 +575,9 @@ impl<'a, I: Ir> Lower<'a, I> {
         let vop3 = d.enc.name.starts_with("ENC_VOP3") || d.enc.name.starts_with("VOP3");
         // the float modifiers are the f32 ops' (`f32_arith`); OP_SEL is no one's yet
         let f32_cmp = name.starts_with("V_CMP") && name.ends_with("_F32");
-        let mods: &[&str] = if F32_ARITH.contains(&name) {
+        let mods: &[&str] = if matches!(name, "V_CVT_F32_F16" | "V_CVT_F16_F32") {
+            &[]
+        } else if F32_ARITH.contains(&name) {
             &["OP_SEL"]
         } else if f32_cmp {
             &["CLAMP", "OMOD", "OP_SEL"]
@@ -678,7 +699,30 @@ impl<'a, I: Ir> Lower<'a, I> {
     fn f32_arith(&mut self, b: usize, d: &Decoded, vop3: bool, s0: u64, s1: u64, vdst: u64) -> R<I::V> {
         let name = d.inst.name;
         let fv = |f: &str| if vop3 { rdna2::field_value(d.enc, &d.words, f).unwrap_or(0) } else { 0 };
-        let n = if matches!(name, "V_FMA_F32" | "V_MAD_F32") { 3 } else { 2 };
+        // integer and f16 sources: no abs / neg (the HLSL path's `fsrc` is for f32 sources)
+        if matches!(name, "V_CVT_F32_I32" | "V_CVT_F32_U32" | "V_CVT_F32_F16") {
+            let a = self.src(b, d, s0)?;
+            let r = match name {
+                "V_CVT_F32_I32" => self.ir.cvt(Cvt::SiToF, a),
+                "V_CVT_F32_U32" => self.ir.cvt(Cvt::UiToF, a),
+                _ => {
+                    let h = if fv("OP_SEL") & 1 == 1 {
+                        let k = self.ir.int(16);
+                        self.ir.bin(Bin::LShr, a, k)
+                    } else {
+                        let k = self.ir.int(0xFFFF);
+                        self.ir.bin(Bin::And, a, k)
+                    };
+                    self.ir.fun(FUn::F16ToF32, h)
+                }
+            };
+            return Ok(self.f32_out(d, vop3, r));
+        }
+        let n = match name {
+            "V_FMA_F32" | "V_MAD_F32" => 3,
+            n if n.starts_with("V_CVT_") => 1,
+            _ => 2,
+        };
         let mut x = Vec::new();
         for (i, code) in [s0, s1, fv("SRC2")].into_iter().take(n).enumerate() {
             let mut v = self.src(b, d, code)?;
@@ -693,6 +737,39 @@ impl<'a, I: Ir> Lower<'a, I> {
         if matches!(name, "V_MAC_F32" | "V_FMAC_F32") {
             x.push(self.read(b, Var::V(vdst as u16)));
         }
+        // integer results: no output modifiers
+        match name {
+            "V_CVT_U32_F32" => return Ok(self.cvt_u32(x[0])),
+            "V_CVT_I32_F32" => return Ok(self.cvt_i32(x[0])),
+            "V_CVT_RPI_I32_F32" | "V_CVT_FLR_I32_F32" => {
+                let mut y = x[0];
+                if name == "V_CVT_RPI_I32_F32" {
+                    let h = self.ir.int(0.5f32.to_bits());
+                    y = self.ir.fbin(FBin::Add, y, h);
+                }
+                let y = self.ir.fun(FUn::Floor, y);
+                return Ok(self.cvt_i32(y));
+            }
+            // omod and clamp in f32, then binary16 (round to nearest even) into one half
+            "V_CVT_F16_F32" => {
+                if self.sets_mode {
+                    return Err(format!("{name}: MODE set by the program"));
+                }
+                let y = self.f32_out(d, vop3, x[0]);
+                let h = self.f16_rne(y);
+                let old = self.read(b, Var::V(vdst as u16));
+                let (keep, h) = if fv("OP_SEL") >> 3 & 1 == 1 {
+                    let k = self.ir.int(16);
+                    (0xFFFF, self.ir.bin(Bin::Shl, h, k))
+                } else {
+                    (0xFFFF_0000, h)
+                };
+                let keep = self.ir.int(keep);
+                let old = self.ir.bin(Bin::And, old, keep);
+                return Ok(self.ir.bin(Bin::Or, old, h));
+            }
+            _ => {}
+        }
         let r = match name {
             "V_ADD_F32" => self.ir.fbin(FBin::Add, x[0], x[1]),
             "V_SUB_F32" => self.ir.fbin(FBin::Sub, x[0], x[1]),
@@ -706,6 +783,12 @@ impl<'a, I: Ir> Lower<'a, I> {
                 self.ir.fbin(FBin::Add, p, x[2])
             }
         };
+        Ok(self.f32_out(d, vop3, r))
+    }
+
+    /// The output modifiers of an f32 result: omod, then clamp.
+    fn f32_out(&mut self, d: &Decoded, vop3: bool, r: I::V) -> I::V {
+        let fv = |f: &str| if vop3 { rdna2::field_value(d.enc, &d.words, f).unwrap_or(0) } else { 0 };
         let r = match fv("OMOD") {
             0 => r,
             m => {
@@ -713,7 +796,116 @@ impl<'a, I: Ir> Lower<'a, I> {
                 self.ir.fbin(FBin::Mul, r, k)
             }
         };
-        Ok(if fv("CLAMP") == 1 { self.ir.fun(FUn::Sat, r) } else { r })
+        if fv("CLAMP") == 1 {
+            self.ir.fun(FUn::Sat, r)
+        } else {
+            r
+        }
+    }
+
+    /// `select(c, k, v)` with k a constant
+    fn sel_k(&mut self, c: I::V, k: u32, v: I::V) -> I::V {
+        let k = self.ir.int(k);
+        self.ir.select(c, k, v)
+    }
+
+    /// `cvt_u32` of the HLSL path: NaN and ≤ 0 give 0, ≥ 2^32 gives 0xFFFFFFFF.
+    fn cvt_u32(&mut self, f: I::V) -> I::V {
+        let (z, big) = (self.ir.int(0), self.ir.int(4294967296.0f32.to_bits()));
+        let (n, le) = (self.ir.is_nan(f), self.ir.fcmp(FCmp::Le, f, z));
+        let low = self.ir.bin(Bin::Or, n, le);
+        let ge = self.ir.fcmp(FCmp::Ge, f, big);
+        let v = self.ir.cvt(Cvt::FToUi, f);
+        let v = self.sel_k(ge, u32::MAX, v);
+        self.sel_k(low, 0, v)
+    }
+
+    /// `cvt_i32` of the HLSL path: NaN gives 0, out of range saturates.
+    fn cvt_i32(&mut self, f: I::V) -> I::V {
+        let (lo, hi) = (self.ir.int((-2147483648.0f32).to_bits()), self.ir.int(2147483648.0f32.to_bits()));
+        let n = self.ir.is_nan(f);
+        let (le, ge) = (self.ir.fcmp(FCmp::Le, f, lo), self.ir.fcmp(FCmp::Ge, f, hi));
+        let v = self.ir.cvt(Cvt::FToSi, f);
+        let v = self.sel_k(ge, 0x7FFF_FFFF, v);
+        let v = self.sel_k(le, 0x8000_0000, v);
+        self.sel_k(n, 0, v)
+    }
+
+    /// `f32_to_f16_rm(f, 0)` of the HLSL path: binary32 bits to binary16, round to nearest even.
+    fn f16_rne(&mut self, x: I::V) -> I::V {
+        let k = |l: &mut Self, v: u32| l.ir.int(v);
+        let and = |l: &mut Self, a: I::V, m: u32| {
+            let m = l.ir.int(m);
+            l.ir.bin(Bin::And, a, m)
+        };
+        let shr = |l: &mut Self, a: I::V, n: u32| {
+            let n = l.ir.int(n);
+            l.ir.bin(Bin::LShr, a, n)
+        };
+        let ucmp = |l: &mut Self, c: Cmp, a: I::V, v: u32| {
+            let v = l.ir.int(v);
+            l.ir.icmp(c, a, v)
+        };
+        let sign = shr(self, x, 16);
+        let sign = and(self, sign, 0x8000);
+        let ax = and(self, x, 0x7FFF_FFFF);
+        // normal: exponent rebased, 10 mantissa bits, 13 bits rounded off
+        let e = shr(self, ax, 23);
+        let k112 = k(self, 112);
+        let e = self.ir.bin(Bin::Sub, e, k112);
+        let k10 = k(self, 10);
+        let e = self.ir.bin(Bin::Shl, e, k10);
+        let m = shr(self, ax, 13);
+        let m = and(self, m, 0x3FF);
+        let h_n = self.ir.bin(Bin::Or, e, m);
+        let rem_n = and(self, ax, 0x1FFF);
+        // denormal: the significand shifted right by 126 - exponent
+        let k126 = k(self, 126);
+        let e = shr(self, ax, 23);
+        let sh = self.ir.bin(Bin::Sub, k126, e);
+        let sig = and(self, ax, 0x007F_FFFF);
+        let k23 = k(self, 0x0080_0000);
+        let sig = self.ir.bin(Bin::Or, sig, k23);
+        let h_d = self.ir.bin(Bin::LShr, sig, sh);
+        let one = k(self, 1);
+        let sh1 = self.ir.bin(Bin::Sub, sh, one);
+        let half_d = self.ir.bin(Bin::Shl, one, sh1);
+        let low = self.ir.bin(Bin::Shl, one, sh);
+        let low = self.ir.bin(Bin::Sub, low, one);
+        let rem_d = self.ir.bin(Bin::And, sig, low);
+        let normal = ucmp(self, Cmp::Uge, ax, 0x3880_0000);
+        let h = self.ir.select(normal, h_n, h_d);
+        let rem = self.ir.select(normal, rem_n, rem_d);
+        let half_n = k(self, 0x1000);
+        let half = self.ir.select(normal, half_n, half_d);
+        let gt = self.ir.icmp(Cmp::Ugt, rem, half);
+        let eq = self.ir.icmp(Cmp::Eq, rem, half);
+        let odd = and(self, h, 1);
+        let odd = ucmp(self, Cmp::Ne, odd, 0);
+        let tie = self.ir.bin(Bin::And, eq, odd);
+        let inc = self.ir.bin(Bin::Or, gt, tie);
+        let inc = self.ir.zext(inc);
+        let r = self.ir.bin(Bin::Add, h, inc);
+        // below half the smallest denormal: 0 or that denormal; too large: infinity
+        let tiny = ucmp(self, Cmp::Ult, ax, 0x3380_0000);
+        let up = ucmp(self, Cmp::Ugt, ax, 0x3300_0000);
+        let up = self.ir.zext(up);
+        let r = self.ir.select(tiny, up, r);
+        let ovf = ucmp(self, Cmp::Uge, ax, 0x4780_0000);
+        let r = self.sel_k(ovf, 0x7C00, r);
+        let zero = ucmp(self, Cmp::Eq, ax, 0);
+        let z = k(self, 0);
+        let r = self.ir.select(zero, z, r);
+        // infinity, or NaN with the payload's top bits
+        let p = shr(self, ax, 13);
+        let p = and(self, p, 0x1FF);
+        let k7e = k(self, 0x7E00);
+        let nan = self.ir.bin(Bin::Or, p, k7e);
+        let is_inf = ucmp(self, Cmp::Eq, ax, 0x7F80_0000);
+        let infnan = self.sel_k(is_inf, 0x7C00, nan);
+        let special = ucmp(self, Cmp::Uge, ax, 0x7F80_0000);
+        let r = self.ir.select(special, infnan, r);
+        self.ir.bin(Bin::Or, sign, r)
     }
 
     /// An f32 compare as the HLSL path writes it (`emit.rs` `float_compare`): the sources take
@@ -1083,6 +1275,7 @@ fn lower<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I) -> R<(
         partial,
         def_block: std::collections::HashMap::new(),
         lane_uses: Vec::new(),
+        sets_mode: insts.iter().any(|d| matches!(d.inst.name, "S_SETREG_IMM32_B32" | "S_SETREG_B32") && rdna2::field_value(d.enc, &d.words, "SIMM16").unwrap_or(0) & 0x3F == 1),
         dpp_src: None,
         dpp_en: None,
     };
@@ -1409,6 +1602,7 @@ pub(crate) mod tests {
         FBin(FBin, u32, u32),
         FUn(FUn, u32),
         FMad(u32, u32, u32),
+        Cvt(Cvt, u32),
         FCmp(FCmp, u32, u32),
         IsNan(u32),
         IoLoad(u32),
@@ -1547,6 +1741,9 @@ pub(crate) mod tests {
         fn fmad(&mut self, a: u32, b: u32, c: u32) -> u32 {
             self.push(Ins::FMad(a, b, c))
         }
+        fn cvt(&mut self, c: Cvt, a: u32) -> u32 {
+            self.push(Ins::Cvt(c, a))
+        }
         fn fcmp(&mut self, c: FCmp, a: u32, b: u32) -> u32 {
             self.push(Ins::FCmp(c, a, b))
         }
@@ -1574,6 +1771,17 @@ pub(crate) mod tests {
         fn ret(&mut self) {
             self.blocks[self.cur].1 = Term::Ret;
         }
+    }
+
+    /// binary16 in the low 16 bits → f32 (`f16tof32`)
+    pub(crate) fn f16_to_f32(h: u32) -> f32 {
+        let (s, e, m) = (h >> 15 & 1, h >> 10 & 0x1F, h & 0x3FF);
+        let v = match e {
+            0 => m as f32 * 2f32.powi(-24),
+            31 => f32::from_bits(0x7F80_0000 | m << 13),
+            _ => f32::from_bits((e + 112) << 23 | m << 13),
+        };
+        if s == 1 { -v } else { v }
     }
 
     /// One lane's position: block, instruction index, the block it came from, its values.
@@ -1683,12 +1891,25 @@ pub(crate) mod tests {
                                     }.to_bits())
                                 }
                                 Ins::FUn(op, a) => {
-                                    let a = f32::from_bits(g(a));
+                                    let g_bits = g(a);
+                                    let a = f32::from_bits(g_bits);
                                     Some(match op {
                                         FUn::Abs => a.abs(),
                                         FUn::Neg => -a,
                                         FUn::Sat => if a.is_nan() { 0.0 } else { a.clamp(0.0, 1.0) },
+                                        FUn::Floor => a.floor(),
+                                        FUn::F16ToF32 => f16_to_f32(g_bits),
                                     }.to_bits())
+                                }
+                                // out of range only where the lowering selects something else
+                                Ins::Cvt(c, a) => {
+                                    let a = g(a);
+                                    Some(match c {
+                                        Cvt::SiToF => (a as i32 as f32).to_bits(),
+                                        Cvt::UiToF => (a as f32).to_bits(),
+                                        Cvt::FToSi => f32::from_bits(a) as i32 as u32,
+                                        Cvt::FToUi => f32::from_bits(a) as u32,
+                                    })
                                 }
                                 Ins::FCmp(c, a, b) => {
                                     let (a, b) = (f32::from_bits(g(a)), f32::from_bits(g(b)));
@@ -1933,6 +2154,58 @@ pub(crate) mod tests {
         ENDPGM,
     ];
 
+    /// f32 ↔ i32 / u32 / f16 conversions: v2 = lane − 16, v4 = (lane << 26 | lane) rounded,
+    /// v6 = (lane − 16) / 4 into the f32 → integer ones, v11 = v4² (out of range) and v19 = NaN
+    /// into the saturating ones; binary16 in and out (denormals, ties to even, overflow, NaN),
+    /// with OP_SEL halves, omod and clamp.
+    pub(crate) const F32_CONVERSIONS: &[I] = &[
+        ("V_LSHRREV_B32", "ENC_VOP3", &[("VDST", 19), ("SRC0", 129), ("SRC1", 193)]),
+        ("V_SUBREV_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 144), ("VSRC1", 0)]),
+        ("V_CVT_F32_I32", "ENC_VOP1", &[("VDST", 2), ("SRC0", V + 1)]),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 154), ("VSRC1", 0)]),
+        ("V_OR_B32", "ENC_VOP2", &[("VDST", 3), ("SRC0", V), ("VSRC1", 3)]),
+        ("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 4), ("SRC0", V + 3)]),
+        ("V_CVT_F32_I32", "ENC_VOP3", &[("VDST", 5), ("SRC0", V + 1), ("OMOD", 3), ("CLAMP", 1)]),
+        ("V_MUL_F32", "ENC_VOP3", &[("VDST", 6), ("SRC0", V + 2), ("SRC1", 240), ("OMOD", 3)]),
+        ("V_CVT_I32_F32", "ENC_VOP1", &[("VDST", 7), ("SRC0", V + 6)]),
+        ("V_CVT_U32_F32", "ENC_VOP1", &[("VDST", 8), ("SRC0", V + 6)]),
+        ("V_CVT_RPI_I32_F32", "ENC_VOP1", &[("VDST", 9), ("SRC0", V + 6)]),
+        ("V_CVT_FLR_I32_F32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V + 6)]),
+        ("V_MUL_F32", "ENC_VOP2", &[("VDST", 11), ("SRC0", V + 4), ("VSRC1", 4)]),
+        ("V_CVT_I32_F32", "ENC_VOP1", &[("VDST", 12), ("SRC0", V + 11)]),
+        ("V_CVT_U32_F32", "ENC_VOP1", &[("VDST", 13), ("SRC0", V + 11)]),
+        ("V_CVT_I32_F32", "ENC_VOP3", &[("VDST", 14), ("SRC0", V + 11), ("NEG", 1)]),
+        ("V_CVT_U32_F32", "ENC_VOP1", &[("VDST", 15), ("SRC0", V + 19)]),
+        ("V_CVT_I32_F32", "ENC_VOP1", &[("VDST", 16), ("SRC0", V + 19)]),
+        // v17 = f16 (lane & 31) << 9 | (lane & 31), the lane in the high half; v20 = it in the
+        // high half, the lane in the low one
+        ("V_AND_B32", "ENC_VOP2", &[("VDST", 23), ("SRC0", 159), ("VSRC1", 0)]),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 17), ("SRC0", 137), ("VSRC1", 23)]),
+        ("V_OR_B32", "ENC_VOP2", &[("VDST", 17), ("SRC0", V + 23), ("VSRC1", 17)]),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 20), ("SRC0", 144), ("VSRC1", 17)]),
+        ("V_OR_B32", "ENC_VOP2", &[("VDST", 20), ("SRC0", V), ("VSRC1", 20)]),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 18), ("SRC0", 144), ("VSRC1", 0)]),
+        ("V_OR_B32", "ENC_VOP2", &[("VDST", 17), ("SRC0", V + 18), ("VSRC1", 17)]),
+        ("V_CVT_F32_F16", "ENC_VOP1", &[("VDST", 21), ("SRC0", V + 17)]),
+        ("V_CVT_F32_F16", "ENC_VOP3", &[("VDST", 22), ("SRC0", V + 20), ("OP_SEL", 1)]),
+        // v24 = 1 + (lane & 31) · 2^-14: f16 ties at lanes 8 and 24; into v25's low half
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 24), ("SRC0", 137), ("VSRC1", 23)]),
+        ("V_OR_B32", "ENC_VOP2", &[("VDST", 24), ("SRC0", 255), ("VSRC1", 24), ("LITERAL", 0x3F80_0000)]),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 25), ("SRC0", V + 20)]),
+        ("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 25), ("SRC0", V + 24)]),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 26), ("SRC0", V)]),
+        ("V_CVT_F16_F32", "ENC_VOP3", &[("VDST", 26), ("SRC0", V + 6), ("OP_SEL", 8)]),
+        // f16 denormals (· 2^-20), below the smallest one (· 2^-25), NaN, overflow, clamp
+        ("V_MUL_F32", "ENC_VOP2", &[("VDST", 28), ("SRC0", 255), ("VSRC1", 24), ("LITERAL", 0x3580_0000)]),
+        ("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 27), ("SRC0", V + 28)]),
+        ("V_MUL_F32", "ENC_VOP2", &[("VDST", 28), ("SRC0", 255), ("VSRC1", 24), ("LITERAL", 0x3300_0000)]),
+        ("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 29), ("SRC0", V + 28)]),
+        ("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 30), ("SRC0", V + 19)]),
+        ("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 31), ("SRC0", V + 11)]),
+        ("V_CVT_F16_F32", "ENC_VOP3", &[("VDST", 32), ("SRC0", V + 6), ("CLAMP", 1)]),
+        ENDPGM,
+    ];
+
     pub(crate) fn compute_cs() -> crate::gpu::recomp::CsInterface {
         crate::gpu::recomp::CsInterface { threads: [64, 1, 1], user_sgprs: 2, tgid: [true, false, false], tg_size: false, tid_components: 1 }
     }
@@ -1956,8 +2229,15 @@ pub(crate) mod tests {
         (0..256).map(|i| 1000 + i).collect()
     }
 
+    /// A line's bytes; a `("LITERAL", k)` field is the instruction's literal dword.
+    pub(crate) fn encode_line((n, e, f): &I) -> Vec<u8> {
+        let lit = f.iter().find(|(k, _)| *k == "LITERAL").map(|&(_, v)| v as u32);
+        let f: Vec<(&str, u64)> = f.iter().copied().filter(|(k, _)| *k != "LITERAL").collect();
+        rdna2::encode(n, e, &f, lit).unwrap()
+    }
+
     pub(crate) fn decode(lines: &[I]) -> Vec<Decoded> {
-        let bytes: Vec<u8> = lines.iter().flat_map(|(n, e, f)| rdna2::encode(n, e, f, None).unwrap()).collect();
+        let bytes: Vec<u8> = lines.iter().flat_map(encode_line).collect();
         let mut out = Vec::new();
         let mut off = 0;
         while off < bytes.len() {
@@ -2329,6 +2609,64 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn f32_conversions_round_and_saturate() {
+        let (s, v) = state(32);
+        let (_, v) = run(F32_CONVERSIONS, false, &s, &v);
+        for (l, r) in v.iter().enumerate() {
+            let f = |i: usize| f32::from_bits(r[i]);
+            let (li, q) = (l as i32 - 16, (l as i32 - 16) as f32 / 4.0);
+            assert_eq!(f(2), li as f32, "lane {l}");
+            assert_eq!(f(4), ((l as u32) << 26 | l as u32) as f32, "lane {l}: u32 rounded to nearest even");
+            assert_eq!(f(5), (li as f32 * 0.5).clamp(0.0, 1.0), "lane {l}: omod and clamp");
+            assert_eq!(f(6), q, "lane {l}");
+            // the HLSL path's cvt_i32 / cvt_u32 saturate as Rust's `as` does, NaN giving 0
+            assert_eq!((r[7], r[8]), (q as i32 as u32, q as u32), "lane {l}: truncated");
+            assert_eq!((r[9], r[10]), ((q + 0.5).floor() as i32 as u32, q.floor() as i32 as u32), "lane {l}: rpi, flr");
+            assert_eq!((r[12], r[13], r[14]), (f(11) as i32 as u32, f(11) as u32, (-f(11)) as i32 as u32), "lane {l}: out of range");
+            assert_eq!((r[15], r[16]), (0, 0), "lane {l}: NaN");
+            assert_eq!(f(21), f16_to_f32(r[17] & 0xFFFF), "lane {l}");
+            assert_eq!(r[22], r[21], "lane {l}: the high half");
+            assert_eq!(r[25] >> 16, r[20] >> 16, "lane {l}: the half kept");
+            assert_eq!(r[26] & 0xFFFF, l as u32, "lane {l}: the half kept");
+            assert_eq!(r[29], (l != 0) as u32, "lane {l}: below the smallest denormal");
+            assert_eq!(r[30], 0x7FFF, "lane {l}: NaN");
+            assert_eq!(r[31], if l == 0 { 0 } else { 0x7C00 }, "lane {l}: overflow");
+        }
+        let lo = |l: usize, i: usize| v[l][i] & 0xFFFF;
+        assert_eq!([lo(0, 21), lo(1, 17), lo(30, 17)], [0, 0x0201, 0x3C1E]);
+        assert_eq!((f32::from_bits(v[1][21]), f32::from_bits(v[30][21])), (513.0 * 2f32.powi(-24), 1.0 + 30.0 / 1024.0), "f16 in");
+        // 1 + k · 2^-14 at k = 1, 8, 16, 24, 31: ties to even at 8 and 24
+        assert_eq!([1, 8, 16, 24, 31].map(|l| lo(l, 25)), [0x3C00, 0x3C00, 0x3C01, 0x3C02, 0x3C02]);
+        assert_eq!([0, 16, 18, 20].map(|l| v[l][26] >> 16), [0xC400, 0, 0x3800, 0x3C00], "f16 into the high half");
+        assert_eq!([0, 18, 20, 31].map(|l| lo(l, 32)), [0, 0x3800, 0x3C00, 0x3C00], "clamp");
+        assert_eq!(lo(0, 27), 0x0010, "2^-20: an f16 denormal");
+    }
+
+    #[test]
+    fn f32_conversions_agree_with_the_hlsl_path_on_the_gpu() {
+        use super::super::{dxc, runner};
+        if runner::adapter().is_err() || dxc::location().is_err() {
+            runner::skip_test(if runner::adapter().is_err() { "no GPU" } else { "no DXC" });
+            return;
+        }
+        agrees_with_hlsl("f32 conversions, wave32", F32_CONVERSIONS, false, &[]);
+        if runner::wave64_supported() != Ok(true) {
+            runner::skip_test("no wave64");
+            return;
+        }
+        agrees_with_hlsl("f32 conversions, wave64", F32_CONVERSIONS, true, &[]);
+    }
+
+    #[test]
+    fn v_cvt_f16_f32_is_refused_where_the_program_writes_mode() {
+        let mode: I = ("S_SETREG_IMM32_B32", "ENC_SOPK", &[("SDST", 0), ("SIMM16", 1 | 3 << 11), ("LITERAL", 4)]);
+        let cvt: I = ("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 242)]);
+        let err = lower_kernel(&decode(&[mode, cvt, ENDPGM]), false, Interp::default()).err().expect("refused");
+        assert!(err.contains("MODE"), "{err}");
+        assert!(lower_kernel(&decode(&[cvt, ENDPGM]), false, Interp::default()).is_ok());
+    }
+
+    #[test]
     fn f32_compares_with_nan_and_vop3_modifiers() {
         let preds: [fn(f32, f32) -> bool; 18] = [
             |_, _| false,
@@ -2476,7 +2814,7 @@ pub(crate) mod tests {
     fn agrees_with_hlsl(name: &str, lines: &[I], wave64: bool, skip: &[usize]) {
         use super::super::{dxc, runner, translate, Options};
         let lanes = if wave64 { 64 } else { 32 };
-        let bytes: Vec<u8> = lines.iter().flat_map(|(n, e, f)| rdna2::encode(n, e, f, None).unwrap()).collect();
+        let bytes: Vec<u8> = lines.iter().flat_map(encode_line).collect();
         let (s, v) = state(lanes);
         let mut st = runner::KernelState::default();
         st.sgpr.copy_from_slice(&s);

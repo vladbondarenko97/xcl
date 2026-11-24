@@ -7,7 +7,7 @@
 //! construction finds trivial keeps its (identical) incoming values instead of being removed:
 //! the builder has no use replacement, and the driver folds such phis.
 
-use super::lower::{self, Bin, Cmp, FBin, FCmp, FUn, Ir};
+use super::lower::{self, Bin, Cmp, Cvt, FBin, FCmp, FUn, Ir};
 use super::ssa::{Sink, Var};
 use crate::gpu::dxil::container::Stage;
 use crate::gpu::dxil::module::{BinOp, Block, CastOp, Pred, Value};
@@ -170,6 +170,10 @@ impl Ir for DxilIr {
         self.bits(r)
     }
     fn fun(&mut self, op: FUn, a: Value) -> Value {
+        if op == FUn::F16ToF32 {
+            let r = self.s.f16_to_f32(a);
+            return self.bits(r);
+        }
         let a = self.f(a);
         let r = match op {
             FUn::Abs => self.s.funary(FUnary::FAbs, a),
@@ -178,6 +182,8 @@ impl Ir for DxilIr {
                 self.s.m.fbin(BinOp::Sub, z, a, 0)
             }
             FUn::Sat => self.s.funary(FUnary::Saturate, a),
+            FUn::Floor => self.s.funary(FUnary::RoundNi, a),
+            FUn::F16ToF32 => unreachable!(),
         };
         self.bits(r)
     }
@@ -185,6 +191,27 @@ impl Ir for DxilIr {
         let (a, b, c) = (self.f(a), self.f(b), self.f(c));
         let r = self.s.tertiary(Tertiary::FMad, a, b, c);
         self.bits(r)
+    }
+    fn cvt(&mut self, c: Cvt, a: Value) -> Value {
+        let (f32, i32) = (self.s.m.f32(), self.s.m.i32());
+        match c {
+            Cvt::SiToF => {
+                let r = self.s.m.cast(CastOp::SIToFP, a, f32);
+                self.bits(r)
+            }
+            Cvt::UiToF => {
+                let r = self.s.m.cast(CastOp::UIToFP, a, f32);
+                self.bits(r)
+            }
+            Cvt::FToSi => {
+                let a = self.f(a);
+                self.s.m.cast(CastOp::FPToSI, a, i32)
+            }
+            Cvt::FToUi => {
+                let a = self.f(a);
+                self.s.m.cast(CastOp::FPToUI, a, i32)
+            }
+        }
     }
     fn fcmp(&mut self, c: FCmp, a: Value, b: Value) -> Value {
         let (a, b) = (self.f(a), self.f(b));
@@ -278,7 +305,7 @@ mod tests {
         if !gpu() {
             return;
         }
-        for (name, lines) in [("straight", STRAIGHT), ("skipped if", SKIPPED_IF), ("leaving loop", LEAVING_LOOP), ("uniform loop", UNIFORM_LOOP), ("memory", MEMORY), ("f32 arithmetic", F32_ARITHMETIC), ("f32 compares", F32_COMPARES)] {
+        for (name, lines) in [("straight", STRAIGHT), ("skipped if", SKIPPED_IF), ("leaving loop", LEAVING_LOOP), ("uniform loop", UNIFORM_LOOP), ("memory", MEMORY), ("f32 arithmetic", F32_ARITHMETIC), ("f32 compares", F32_COMPARES), ("f32 conversions", F32_CONVERSIONS)] {
             let insts = decode(lines);
             let (dxil, stale) = super::kernel(&insts, false).unwrap_or_else(|e| panic!("{name}: {e}"));
             let (s, v) = state(32);
