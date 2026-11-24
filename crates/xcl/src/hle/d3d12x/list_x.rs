@@ -1152,6 +1152,48 @@ unsafe fn prune_title_fence(fence_raw: usize, tf: &mut TitleFenceSync) {
     }
 }
 
+/// One line per queue with outstanding work in the sync graph, in submission order: its pending
+/// GPU signals and the waits it has not got past, each wait with the queue and submission (`q1#57`)
+/// that can satisfy it. Read together, the lines show what each stuck queue waits on.
+fn sync_graph_dump(graph: &SyncGraph, qid: impl Fn(usize) -> usize) -> String {
+    const PER_QUEUE: usize = 12;
+    let by = |signals: &[SubmittedSignal], val: u64| {
+        signals.iter().find(|s| s.val >= val).map(|s| format!("q{}#{}", qid(s.queue), s.seq))
+    };
+    let mut per_q: std::collections::BTreeMap<usize, Vec<(u64, String)>> = Default::default();
+    for (&va, cell) in &graph.cells {
+        for aw in &cell.armed_waits {
+            let src = by(&cell.submitted_signals, aw.val)
+                .unwrap_or_else(|| format!("no GPU signal (recorded={:#x}, submitted={:#x})", cell.recorded_max, cell.submitted_max));
+            let ms = aw.armed_at.elapsed().as_millis();
+            per_q.entry(qid(aw.waiting_queue)).or_default().push((aw.wait_seq, format!("#{} wait {va:#x}>={:#x} {ms}ms <- {src}", aw.wait_seq, aw.val)));
+        }
+        for s in &cell.submitted_signals {
+            per_q.entry(qid(s.queue)).or_default().push((s.seq, format!("#{} signal {va:#x}={:#x}", s.seq, s.val)));
+        }
+    }
+    for (&f, tf) in &graph.title_fences {
+        for &(val, wq, wseq) in &tf.waits {
+            let src = by(&tf.signals, val).unwrap_or_else(|| "no signal submitted".into());
+            per_q.entry(qid(wq)).or_default().push((wseq, format!("#{wseq} wait fence {f:#x}>={val:#x} <- {src}")));
+        }
+        for s in &tf.signals {
+            per_q.entry(qid(s.queue)).or_default().push((s.seq, format!("#{} signal fence {f:#x}={:#x}", s.seq, s.val)));
+        }
+    }
+    let mut out = String::new();
+    for (q, mut items) in per_q {
+        items.sort_by_key(|i| i.0);
+        let more = items.len().saturating_sub(PER_QUEUE);
+        let shown: Vec<&str> = items.iter().take(PER_QUEUE).map(|i| i.1.as_str()).collect();
+        out += &format!("\n  q{q}: {}", shown.join(", "));
+        if more > 0 {
+            out += &format!(" (+{more} more)");
+        }
+    }
+    out
+}
+
 /// Exact `(queue, seq)` cycle detection BEFORE emitting `sig_q.Signal(&cell_va_fence, sig_val)`.
 ///
 /// Theorem: in any GPU deadlock cycle of length `k >= 1` (`q_0 -> q_1 -> ... -> q_0`), every queue
@@ -1374,11 +1416,26 @@ fn wake_sync_watchdog() {
                 continue;
             }
             let _ = cv.wait_timeout(guard, Duration::from_millis(50)).unwrap();
+            let mut dump: Option<String> = None;
             let (expired, rewinds) = {
                 let mut g = SYNC_GRAPH.lock().unwrap();
                 let mut out: Vec<(u64, u64, ID3D12Fence, usize, i32, Option<usize>, Option<i32>, u64, u64, u64)> = Vec::new();
                 let mut rew: Vec<(ID3D12Fence, u64)> = Vec::new();
                 if let Some(graph) = g.as_mut() {
+                    static DUMPS: AtomicU64 = AtomicU64::new(0);
+                    let expiring = graph
+                        .cells
+                        .values()
+                        .any(|c| c.armed_waits.iter().any(|aw| aw.armed_at.elapsed() >= GPU_WAIT_WATCHDOG_TIMEOUT));
+                    if expiring && once(&DUMPS, 4) {
+                        for c in graph.cells.values_mut() {
+                            unsafe { prune_completed_waits(c) };
+                        }
+                        for (&f, tf) in graph.title_fences.iter_mut() {
+                            unsafe { prune_title_fence(f, tf) };
+                        }
+                        dump = Some(sync_graph_dump(graph, queue_id));
+                    }
                     for (&va, cell) in graph.cells.iter_mut() {
                         if cell.armed_waits.is_empty() && cell.cpu_signaled_max == 0 {
                             continue;
@@ -1457,6 +1514,9 @@ fn wake_sync_watchdog() {
             }
             if had_expired {
                 crate::xlog_warn!("D3D12.X: pending title ID3D12Fences during GPU wait timeout: {}", super::fence_x::pending_summary());
+            }
+            if let Some(d) = dump {
+                crate::xlog_warn!("D3D12.X: queue waits and signals when a GPU wait timed out (#submission per queue, <- the submission that satisfies it):{d}");
             }
         });
         pair
@@ -4072,6 +4132,41 @@ pub(super) unsafe extern "system" fn resolve_query_data_x(this: *mut c_void, hea
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn sync_graph_dump_names_the_submission_each_wait_needs() {
+        // q1 waits on a cell q2 signals; q2 waits on a title fence q1 signals after its wait: a cycle.
+        let mut graph = SyncGraph::default();
+        let cell = graph.cells.entry(0x100).or_default();
+        cell.armed_waits.push(ArmedGpuWait {
+            val: 5,
+            waiting_queue: 10,
+            waiting_queue_ty: 2,
+            wait_seq: 3,
+            armed_at: Instant::now(),
+            after_write64: false,
+        });
+        cell.submitted_signals.push(SubmittedSignal { val: 5, queue: 20, seq: 7 });
+        graph.cells.entry(0x200).or_default().armed_waits.push(ArmedGpuWait {
+            val: 9,
+            waiting_queue: 20,
+            waiting_queue_ty: 0,
+            wait_seq: 8,
+            armed_at: Instant::now(),
+            after_write64: false,
+        });
+        let tf = graph.title_fences.entry(0x55).or_default();
+        tf.waits.push((2, 20, 4));
+        tf.signals.push(SubmittedSignal { val: 2, queue: 10, seq: 9 });
+
+        let d = sync_graph_dump(&graph, |q| q / 10);
+        let lines: Vec<&str> = d.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 2, "{d}");
+        assert!(lines[0].starts_with("  q1: #3 wait 0x100>=0x5 "), "{d}");
+        assert!(lines[0].ends_with("ms <- q2#7, #9 signal fence 0x55=0x2"), "{d}");
+        assert!(lines[1].starts_with("  q2: #4 wait fence 0x55>=0x2 <- q1#9, #7 signal 0x100=0x5, #8 wait 0x200>=0x9 "), "{d}");
+        assert!(lines[1].ends_with("ms <- no GPU signal (recorded=0x0, submitted=0x0)"), "{d}");
+    }
 
     #[test]
     fn copy_scratch_budget_counts_resources_until_gpu_completion() {
