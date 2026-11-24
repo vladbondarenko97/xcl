@@ -265,19 +265,7 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
         None => Uploader::new(dev)?,
     };
     // where each texture's texels go in the upload buffer
-    let mut failed = Vec::new();
-    let mut planned = Vec::with_capacity(items.len());
-    let mut total = 0u64;
-    for (k, (res, subs, states)) in items.iter().enumerate() {
-        match layout(dev, res, subs, states, states) {
-            Ok(l) => {
-                let base = total.div_ceil(PLACEMENT) * PLACEMENT;
-                total = base + l.total;
-                planned.push((k, l, base));
-            }
-            Err(e) => failed.push((k, e)),
-        }
-    }
+    let (failed, planned, total) = plan_batch(dev, items);
     if planned.is_empty() {
         put_back(key, up);
         return Ok(failed);
@@ -302,6 +290,50 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
     }
     put_back(key, up);
     Ok(failed)
+}
+
+unsafe fn plan_batch(dev: &ID3D12Device, items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)]) -> (Vec<(usize, String)>, Vec<(usize, Layout, u64)>, u64) {
+    let mut failed = Vec::new();
+    let mut planned = Vec::with_capacity(items.len());
+    let mut total = 0u64;
+    for (k, (res, subs, states)) in items.iter().enumerate() {
+        match layout(dev, res, subs, states, states) {
+            Ok(l) => {
+                let base = total.div_ceil(PLACEMENT) * PLACEMENT;
+                total = base + l.total;
+                planned.push((k, l, base));
+            }
+            Err(e) => failed.push((k, e)),
+        }
+    }
+    (failed, planned, total)
+}
+
+pub struct InFlight {
+    _alloc: ID3D12CommandAllocator,
+    _list: ID3D12GraphicsCommandList,
+    _staging: ID3D12Resource,
+    pub bytes: u64,
+}
+
+pub unsafe fn submit_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)]) -> Result<(Vec<(usize, String)>, Option<InFlight>), String> {
+    let (failed, planned, bytes) = plan_batch(dev, items);
+    if planned.is_empty() {
+        return Ok((failed, None));
+    }
+    let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(err)?;
+    let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(err)?;
+    let staging = buffer(dev, bytes)?;
+    let mut mapped = std::ptr::null_mut();
+    staging.Map(0, None, Some(&mut mapped)).map_err(err)?;
+    for (k, layout, base) in &planned {
+        let (res, subs, states) = &items[*k];
+        record_into(&list, res, subs, layout, states, states, &staging, mapped as *mut u8, *base);
+    }
+    staging.Unmap(0, None);
+    list.Close().map_err(err)?;
+    queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).map_err(err)?)]);
+    Ok((failed, Some(InFlight { _alloc: alloc, _list: list, _staging: staging, bytes })))
 }
 
 fn put_back(key: usize, up: Uploader) {

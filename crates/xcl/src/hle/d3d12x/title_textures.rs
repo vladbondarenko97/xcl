@@ -776,7 +776,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
             })
             .collect()
     });
-    upload_all(todo);
+    upload_all(todo, ID3D12CommandQueue::from_raw_borrowed(&queue));
 }
 
 /// texture → `content_hash` of its memory at its last upload
@@ -817,8 +817,79 @@ fn content_hash(b: &[u8]) -> u64 {
 /// staging bytes of one batch at most
 const BATCH_BYTES: usize = 256 << 20;
 
+struct QueueUploads {
+    fence: ID3D12Fence,
+    value: u64,
+    in_flight: std::collections::VecDeque<(u64, texture::InFlight)>,
+    bytes: u64,
+}
+
+unsafe impl Send for QueueUploads {}
+
+static ON_QUEUE: Mutex<BTreeMap<usize, QueueUploads>> = Mutex::new(BTreeMap::new());
+
+const IN_FLIGHT_BYTES: u64 = 512 << 20;
+
+unsafe fn title_queue_for(dev: &ID3D12Device, title: Option<&ID3D12CommandQueue>) -> Option<ID3D12CommandQueue> {
+    let q = title?;
+    if q.GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT {
+        return None;
+    }
+    let mut qd: Option<ID3D12Device> = None;
+    q.GetDevice(&mut qd).ok()?;
+    (qd?.as_raw() == dev.as_raw()).then(|| q.clone())
+}
+
+unsafe fn reclaim(dev: &ID3D12Device, q: &mut QueueUploads, cap: u64, wait_ms: u32) {
+    let done = q.fence.GetCompletedValue();
+    while q.in_flight.front().is_some_and(|&(v, _)| v <= done) {
+        let (_, f) = q.in_flight.pop_front().unwrap();
+        q.bytes -= f.bytes;
+    }
+    while q.bytes > cap {
+        let Some(&(v, _)) = q.in_flight.front() else { break };
+        if crate::gpu::fence::wait(&q.fence, v, dev, None, wait_ms).is_err() {
+            break;
+        }
+        let (_, f) = q.in_flight.pop_front().unwrap();
+        q.bytes -= f.bytes;
+    }
+}
+
+unsafe fn submit_on_title_queue(dev: &ID3D12Device, queue: &ID3D12CommandQueue, batch: &[(ID3D12Resource, Vec<Subresource>, Vec<D3D12_RESOURCE_STATES>)]) -> Result<Vec<(usize, String)>, String> {
+    let (failed, f) = texture::submit_batch(dev, queue, batch)?;
+    let Some(f) = f else { return Ok(failed) };
+    let mut g = ON_QUEUE.lock().unwrap();
+    let key = queue.as_raw() as usize;
+    if !g.contains_key(&key) {
+        match dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) {
+            Ok(fence) => {
+                g.insert(key, QueueUploads { fence, value: 0, in_flight: std::collections::VecDeque::new(), bytes: 0 });
+            }
+            Err(e) => {
+                texture::wait(dev, queue)?;
+                drop(f);
+                return Err(e.to_string());
+            }
+        }
+    }
+    let q = g.get_mut(&key).unwrap();
+    q.value += 1;
+    if let Err(e) = queue.Signal(&q.fence, q.value) {
+        q.value -= 1;
+        texture::wait(dev, queue)?;
+        drop(f);
+        return Err(e.to_string());
+    }
+    q.bytes += f.bytes;
+    let v = q.value;
+    q.in_flight.push_back((v, f));
+    reclaim(dev, q, IN_FLIGHT_BYTES, 10_000);
+    Ok(failed)
+}
+
 /// The uploads `todo`, in batches of up to `BATCH_BYTES` (one list and one wait each).
-unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
+unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>, title: Option<&ID3D12CommandQueue>) {
     static N: AtomicU64 = AtomicU64::new(0);
     let warn = |e: &str| {
         if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -863,6 +934,18 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
         }
         let d = device as *mut c_void;
         let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { continue };
+        if let Some(tq) = title_queue_for(dev, title) {
+            match own_work(|| submit_on_title_queue(dev, &tq, &batch)) {
+                Ok(failed) => {
+                    for (_, e) in failed {
+                        warn(&e);
+                    }
+                    UPLOADS.fetch_add(batch.len() as u64, Ordering::Relaxed);
+                }
+                Err(e) => warn(&e),
+            }
+            continue;
+        }
         let queue = match upload_queue(dev, device) {
             Ok(q) => q,
             Err(e) => {
@@ -1219,6 +1302,139 @@ mod tests {
         forget(b);
     }
 
+    unsafe fn read_r8(dev: &ID3D12Device, queue: &ID3D12CommandQueue, texture: &ID3D12Resource) -> Vec<u8> {
+        own_work(|| {
+            let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            let mut total = 0;
+            dev.GetCopyableFootprints(&texture.GetDesc(), 0, 1, 0, Some(&mut footprint), None, None, Some(&mut total));
+            let mut readback = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: total, Height: 1, DepthOrArraySize: 1, MipLevels: 1, SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default() },
+                D3D12_RESOURCE_STATE_COPY_DEST, None, &mut readback,
+            ).unwrap();
+            let readback: ID3D12Resource = readback.unwrap();
+            let allocator: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).unwrap();
+            let barrier = |before, after| D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 { Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER { pResource: std::mem::transmute_copy(texture), Subresource: 0, StateBefore: before, StateAfter: after }) },
+                ..Default::default()
+            };
+            list.ResourceBarrier(&[barrier(D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&readback), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint } };
+            let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(texture), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+            list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+            list.ResourceBarrier(&[barrier(D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
+            list.Close().unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Signal(&fence, 1).unwrap();
+            crate::gpu::fence::wait(&fence, 1, dev, None, 5_000).unwrap();
+            let mut data = std::ptr::null_mut();
+            readback.Map(0, None, Some(&mut data)).unwrap();
+            let mut out = Vec::with_capacity(64 * 64);
+            for y in 0..64 {
+                out.extend_from_slice(std::slice::from_raw_parts((data as *const u8).add(footprint.Offset as usize + y * footprint.Footprint.RowPitch as usize), 64));
+            }
+            readback.Unmap(0, None);
+            out
+        })
+    }
+
+    #[test]
+    fn gpu_uploads_on_the_title_queue_run_before_its_later_work_and_are_released() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC};
+
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap();
+        if super::super::backend() != super::super::Backend::Real {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        }
+        unsafe {
+            let raw_device = super::super::real::device_raw();
+            let dev = ID3D12Device::from_raw_borrowed(&raw_device).unwrap();
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let compute: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COMPUTE, ..Default::default() }).unwrap();
+            assert!(title_queue_for(dev, Some(&queue)).is_some());
+            assert!(title_queue_for(dev, Some(&compute)).is_none());
+            assert!(title_queue_for(dev, None).is_none());
+            let mut texture = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 64, Height: 64, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() },
+                D3D12_RESOURCE_STATE_COMMON, None, &mut texture,
+            ).unwrap();
+            let texture: ID3D12Resource = texture.unwrap();
+            let key = queue.as_raw() as usize;
+            let upload = |value: u8| {
+                let subs = vec![Subresource { depth: 1, rows: 64, row_bytes: 64, data: vec![value; 64 * 64] }];
+                own_work(|| submit_on_title_queue(dev, &queue, &[(texture.clone(), subs, vec![D3D12_RESOURCE_STATE_COMMON])])).unwrap();
+            };
+            for value in [0x21, 0xC4] {
+                upload(value);
+                assert_eq!(read_r8(dev, &queue, &texture), vec![value; 64 * 64], "the title queue's next work sees the upload");
+            }
+            upload(0x5E);
+            {
+                let mut g = ON_QUEUE.lock().unwrap();
+                let q = g.get_mut(&key).unwrap();
+                assert_eq!(q.value, 3);
+                reclaim(dev, q, 0, 10_000);
+                assert!(q.in_flight.is_empty() && q.bytes == 0, "over the cap the oldest uploads are waited for and released");
+                assert!(q.fence.GetCompletedValue() >= 3);
+            }
+            assert_eq!(read_r8(dev, &queue, &texture), vec![0x5E; 64 * 64]);
+            ON_QUEUE.lock().unwrap().remove(&key);
+        }
+    }
+
+    #[test]
+    fn gpu_an_upload_still_running_is_kept_when_its_wait_times_out() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC};
+
+        let _vram_guard = super::super::vram::VRAM_TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock().unwrap();
+        if super::super::backend() != super::super::Backend::Real {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        }
+        unsafe {
+            let raw_device = super::super::real::device_raw();
+            let dev = ID3D12Device::from_raw_borrowed(&raw_device).unwrap();
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Wait(&gate, 1).unwrap();
+            let mut texture = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 64, Height: 64, DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default() },
+                D3D12_RESOURCE_STATE_COMMON, None, &mut texture,
+            ).unwrap();
+            let texture: ID3D12Resource = texture.unwrap();
+            let key = queue.as_raw() as usize;
+            let subs = vec![Subresource { depth: 1, rows: 64, row_bytes: 64, data: vec![0x77; 64 * 64] }];
+            own_work(|| submit_on_title_queue(dev, &queue, &[(texture.clone(), subs, vec![D3D12_RESOURCE_STATE_COMMON])])).unwrap();
+            {
+                let mut g = ON_QUEUE.lock().unwrap();
+                let q = g.get_mut(&key).unwrap();
+                reclaim(dev, q, 0, 50);
+                assert_eq!(q.in_flight.len(), 1, "a batch the GPU has not run stays in flight when its wait times out");
+                assert!(q.bytes > 0);
+            }
+            gate.Signal(1).unwrap();
+            {
+                let mut g = ON_QUEUE.lock().unwrap();
+                let q = g.get_mut(&key).unwrap();
+                reclaim(dev, q, 0, 10_000);
+                assert!(q.in_flight.is_empty() && q.bytes == 0);
+            }
+            assert_eq!(read_r8(dev, &queue, &texture), vec![0x77; 64 * 64]);
+            ON_QUEUE.lock().unwrap().remove(&key);
+        }
+    }
+
     /// Real uploads, dirty-page detection and a source changing after registration:
     /// bookkeeping alone cannot show that the bytes the GPU sees follow the mirror.
     #[test]
@@ -1266,45 +1482,6 @@ mod tests {
             assert!(!crate::gpu::uma::get().unwrap().contains(at), "exercise the Windows fallback");
             assert!(kernelx::in_graphics_reservation(at), "fallback must be write-watched");
             reservation
-        }
-        unsafe fn read_r8(dev: &ID3D12Device, queue: &ID3D12CommandQueue, texture: &ID3D12Resource) -> Vec<u8> {
-            own_work(|| {
-                let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
-                let mut total = 0;
-                dev.GetCopyableFootprints(&texture.GetDesc(), 0, 1, 0, Some(&mut footprint), None, None, Some(&mut total));
-                let mut readback = None;
-                dev.CreateCommittedResource(
-                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE,
-                    &D3D12_RESOURCE_DESC { Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: total, Height: 1, DepthOrArraySize: 1, MipLevels: 1, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default() },
-                    D3D12_RESOURCE_STATE_COPY_DEST, None, &mut readback,
-                ).unwrap();
-                let readback: ID3D12Resource = readback.unwrap();
-                let allocator: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
-                let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).unwrap();
-                let barrier = |before, after| D3D12_RESOURCE_BARRIER {
-                    Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-                    Anonymous: D3D12_RESOURCE_BARRIER_0 { Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER { pResource: std::mem::transmute_copy(texture), Subresource: 0, StateBefore: before, StateAfter: after }) },
-                    ..Default::default()
-                };
-                list.ResourceBarrier(&[barrier(D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
-                let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&readback), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint } };
-                let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(texture), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
-                list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
-                list.ResourceBarrier(&[barrier(D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
-                list.Close().unwrap();
-                queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
-                let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
-                queue.Signal(&fence, 1).unwrap();
-                crate::gpu::fence::wait(&fence, 1, dev, None, 5_000).unwrap();
-                let mut data = std::ptr::null_mut();
-                readback.Map(0, None, Some(&mut data)).unwrap();
-                let mut out = Vec::with_capacity(64 * 64);
-                for y in 0..64 {
-                    out.extend_from_slice(std::slice::from_raw_parts((data as *const u8).add(footprint.Offset as usize + y * footprint.Footprint.RowPitch as usize), 64));
-                }
-                readback.Unmap(0, None);
-                out
-            })
         }
         unsafe {
             let raw_device = super::super::real::device_raw();
