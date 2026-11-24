@@ -21,6 +21,8 @@ use super::ssa::{Sink, Ssa, Var};
 use super::{KERNEL_SCC_SLOT, KERNEL_SGPRS, KERNEL_VGPRS};
 use crate::gpu::rdna2::{self, Decoded, Variant};
 
+mod wave;
+
 type R<T> = Result<T, String>;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -69,6 +71,11 @@ pub trait Ir: Sink {
     fn thread_id(&mut self, k: u32) -> Self::V;
     /// the wave's ballot of `c`: lanes 0–31, 32–63
     fn ballot(&mut self, c: Self::V) -> [Self::V; 2];
+    /// `v` as lane `lane` holds it (`WaveReadLaneAt`); `lane` may differ between lanes and is
+    /// always one running this instruction too
+    fn read_lane(&mut self, v: Self::V, lane: Self::V) -> Self::V;
+    /// the number of bits set in `v` (`countbits`)
+    fn count_bits(&mut self, v: Self::V) -> Self::V;
     fn io_load(&mut self, dword: Self::V) -> Self::V;
     fn res_store(&mut self, dword: Self::V, value: Self::V);
     /// the dword of the flat memory (`mem`, u2) at a byte address (a multiple of 4); out of
@@ -112,6 +119,9 @@ struct Lower<'a, I: Ir> {
     /// the IR block each mask bit was written in, and the mask bits read (block, value)
     def_block: std::collections::HashMap<I::V, usize>,
     lane_uses: Vec<(usize, I::V)>,
+    /// a DPP instruction's first source, read from its source lane, and its write enable
+    dpp_src: Option<I::V>,
+    dpp_en: Option<I::V>,
 }
 
 /// A vector memory store: a side effect inactive lanes must not have.
@@ -219,6 +229,9 @@ impl<'a, I: Ir> Lower<'a, I> {
 
     /// A scalar or vector source operand as a number.
     fn src(&mut self, b: usize, d: &Decoded, code: u64) -> R<I::V> {
+        if let (233 | 234 | 250, Some(v)) = (code, self.dpp_src) {
+            return Ok(v);
+        }
         Ok(match code {
             0..=105 | 106 | 107 | 124 | 126 | 127 => self.read_num(b, code as u8)?,
             128..=192 => self.ir.int((code - 128) as u32),
@@ -246,6 +259,13 @@ impl<'a, I: Ir> Lower<'a, I> {
     }
 
     fn write_v(&mut self, b: usize, d: &Decoded, r: u16, v: I::V) -> R<()> {
+        let v = match self.dpp_en.take() {
+            Some(en) => {
+                let old = self.read(b, Var::V(r));
+                self.ir.select(en, v, old)
+            }
+            None => v,
+        };
         let v = if self.guarded.contains(&d.pc) {
             let old = self.read(b, Var::V(r));
             let e = self.read_bit(b, EXEC)?;
@@ -301,6 +321,9 @@ impl<'a, I: Ir> Lower<'a, I> {
         let name = d.inst.name;
         let fv = |f: &str| rdna2::field_value(d.enc, &d.words, f);
         let (s0, s1, sd) = (fv("SSRC0").unwrap_or(0), fv("SSRC1").unwrap_or(0), fv("SDST").unwrap_or(0) as u8);
+        if self.wave_salu(b, d)? {
+            return Ok(());
+        }
         let width = if self.wave64 { "_B64" } else { "_B32" };
         // mask-width ops: on lane bits when they write EXEC, are a saveexec, or read a mask
         if let Some(base) = name.strip_suffix(width) {
@@ -458,9 +481,21 @@ impl<'a, I: Ir> Lower<'a, I> {
     }
 
     fn valu(&mut self, b: usize, d: &Decoded) -> R<()> {
+        if matches!(d.variant, Variant::Dpp16 | Variant::Dpp8) {
+            self.dpp(b, d)?;
+        }
+        let r = self.valu_op(b, d);
+        (self.dpp_src, self.dpp_en) = (None, None);
+        r
+    }
+
+    fn valu_op(&mut self, b: usize, d: &Decoded) -> R<()> {
         let name = d.inst.name;
-        if d.variant != Variant::Plain {
-            return Err(format!("{name}: SDWA / DPP"));
+        if d.variant == Variant::Sdwa {
+            return Err(format!("{name}: SDWA"));
+        }
+        if self.wave_valu(b, d)? {
+            return Ok(());
         }
         let fv = |f: &str| rdna2::field_value(d.enc, &d.words, f);
         let vop3 = d.enc.name.starts_with("ENC_VOP3") || d.enc.name.starts_with("VOP3");
@@ -841,6 +876,8 @@ fn lower<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I) -> R<(
         partial,
         def_block: std::collections::HashMap::new(),
         lane_uses: Vec::new(),
+        dpp_src: None,
+        dpp_en: None,
     };
     // the registers the program names, and the ones the runner reads back
     let mut sregs: Vec<u8> = vec![VCC, VCC + 1, 124, EXEC, EXEC + 1];
@@ -996,6 +1033,8 @@ fn lower<I: Ir>(insts: &[Decoded], stage: Stage, wave64: bool, mut ir: I) -> R<(
                 l.valu(cur, d)?;
             } else if name.starts_with("GLOBAL_") || name.starts_with("FLAT_") {
                 l.vmem(cur, d)?;
+            } else if name == "DS_SWIZZLE_B32" {
+                l.swizzle(cur, d)?;
             } else {
                 return Err(format!("unsupported {name}"));
             }
@@ -1155,6 +1194,8 @@ pub(crate) mod tests {
         GroupId(u32),
         ThreadId(u32),
         Ballot(u32, usize),
+        ReadLane(u32, u32),
+        CountBits(u32),
         IoLoad(u32),
         ResStore(u32, u32),
         MemLoad(u32),
@@ -1269,6 +1310,12 @@ pub(crate) mod tests {
         }
         fn ballot(&mut self, c: u32) -> [u32; 2] {
             [self.push(Ins::Ballot(c, 0)), self.push(Ins::Ballot(c, 1))]
+        }
+        fn read_lane(&mut self, v: u32, lane: u32) -> u32 {
+            self.push(Ins::ReadLane(v, lane))
+        }
+        fn count_bits(&mut self, v: u32) -> u32 {
+            self.push(Ins::CountBits(v))
         }
         fn io_load(&mut self, dword: u32) -> u32 {
             self.push(Ins::IoLoad(dword))
@@ -1386,7 +1433,8 @@ pub(crate) mod tests {
                                 Ins::Lane => Some(lane as u32),
                                 Ins::GroupId(k) => Some(group[*k as usize]),
                                 Ins::ThreadId(k) => Some(if *k == 0 { base + lane as u32 } else { 0 }),
-                                Ins::Ballot(..) => break,
+                                Ins::Ballot(..) | Ins::ReadLane(..) => break,
+                                Ins::CountBits(v) => Some(g(v).count_ones()),
                                 Ins::IoLoad(a) => Some(io[g(a) as usize]),
                                 Ins::MemLoad(a) => Some(mem.get((g(a) / 4) as usize).copied().unwrap_or(0)),
                                 Ins::MemStore(a, v) => {
@@ -1425,20 +1473,34 @@ pub(crate) mod tests {
                 if ls.iter().all(|s| s.done) {
                     return;
                 }
-                // every lane waits at the same ballot
-                let (b, at) = (ls[0].block, ls[0].at);
-                assert!(ls.iter().all(|s| !s.done && s.block == b && s.at == at), "a ballot not reached by every lane");
-                let (id, Ins::Ballot(c, half)) = &self.blocks[b].0[at] else { unreachable!() };
-                let mut bits = 0u64;
-                for (lane, s) in ls.iter().enumerate() {
-                    if s.env[&self.res(*c)] != 0 {
-                        bits |= 1 << lane;
+                // the lanes waiting at the first wave operation (in block order: a loop's body
+                // before what follows it) run it together, as the lanes active there
+                let (b, at) = ls.iter().filter(|s| !s.done).map(|s| (s.block, s.at)).min().unwrap();
+                let group: Vec<usize> = (0..ls.len()).filter(|&l| !ls[l].done && (ls[l].block, ls[l].at) == (b, at)).collect();
+                let (id, ins) = &self.blocks[b].0[at];
+                let out: Vec<u32> = match ins {
+                    Ins::Ballot(c, half) => {
+                        let mut bits = 0u64;
+                        for &l in &group {
+                            if self.value(&ls[l].env, *c) != 0 {
+                                bits |= 1 << l;
+                            }
+                        }
+                        vec![(bits >> (32 * half)) as u32; group.len()]
                     }
-                }
-                let word = (bits >> (32 * half)) as u32;
-                for s in &mut ls {
-                    s.env.insert(*id, word);
-                    s.at += 1;
+                    Ins::ReadLane(v, from) => group
+                        .iter()
+                        .map(|&l| {
+                            let src = self.value(&ls[l].env, *from) as usize;
+                            assert!(group.contains(&src), "lane {l} reads lane {src}, which is elsewhere");
+                            self.value(&ls[src].env, *v)
+                        })
+                        .collect(),
+                    _ => unreachable!(),
+                };
+                for (&l, x) in group.iter().zip(out) {
+                    ls[l].env.insert(*id, x);
+                    ls[l].at += 1;
                 }
             }
         }
@@ -1896,5 +1958,180 @@ pub(crate) mod tests {
             ENDPGM,
         ]);
         assert!(lower_kernel(&insts, false, Interp::default()).is_err());
+    }
+
+    /// Cross-lane reads with EXEC narrowed to the lanes above 4 (`v_cmpx`): readfirstlane,
+    /// the counts of EXEC as a number, mbcnt, readlane / writelane, DPP16 / DPP8 sources,
+    /// permlanex16 and ds_swizzle.
+    fn lane_reads(wave64: bool) -> Vec<I> {
+        let mut p: Vec<I> = vec![
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 132)]),
+            ("V_CMPX_LT_U32", "ENC_VOPC", &[("SRC0", V + 2), ("VSRC1", 0)]),
+            ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", V)]),
+            ("V_MBCNT_LO_U32_B32", "ENC_VOP3", &[("VDST", 3), ("SRC0", 126), ("SRC1", 128)]),
+            ("V_MUL_LO_U32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V), ("SRC1", 131)]),
+            ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V + 4), ("SRC1", 137)]),
+            ("V_WRITELANE_B32", "ENC_VOP3", &[("VDST", 5), ("SRC0", 2), ("SRC1", 130)]),
+            // row_shr:1 with bound_ctrl; quad_perm [3,2,1,0] on rows 1 and 3; DPP8 reversed, added
+            ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 6), ("SRC0", 0xFA), ("VSRC0", 4), ("DPP_CTRL", 0x111), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF), ("BOUND_CTRL", 1)]),
+            ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 7), ("SRC0", 0xFA), ("VSRC0", 4), ("DPP_CTRL", 0x1B), ("ROW_MASK", 0xA), ("BANK_MASK", 0xF)]),
+            ("V_ADD_NC_U32", "VOP2_VOP_DPP8", &[("VDST", 8), ("SRC0", 0xE9), ("VSRC0", 4), ("VSRC1", 0), ("LANE_SEL_0", 7), ("LANE_SEL_1", 6), ("LANE_SEL_2", 5), ("LANE_SEL_3", 4), ("LANE_SEL_4", 3), ("LANE_SEL_5", 2), ("LANE_SEL_6", 1), ("LANE_SEL_7", 0)]),
+            ("S_MOVK_I32", "ENC_SOPK", &[("SDST", 5), ("SIMM16", 0x3210)]),
+            ("S_MOVK_I32", "ENC_SOPK", &[("SDST", 6), ("SIMM16", 0x7F54)]),
+            ("V_PERMLANEX16_B32", "ENC_VOP3", &[("VDST", 9), ("SRC0", V + 4), ("SRC1", 5), ("SRC2", 6)]),
+            // xor 1 (and 0x1F, or 0, xor 1); quad mode [3,2,1,0]
+            ("DS_SWIZZLE_B32", "ENC_DS", &[("VDST", 10), ("ADDR", 4), ("OFFSET0", 0x1F), ("OFFSET1", 0x04)]),
+            ("DS_SWIZZLE_B32", "ENC_DS", &[("VDST", 11), ("ADDR", 4), ("OFFSET0", 0x1B), ("OFFSET1", 0x80)]),
+        ];
+        if wave64 {
+            p.extend_from_slice(&[
+                ("V_MBCNT_HI_U32_B32", "ENC_VOP3", &[("VDST", 3), ("SRC0", 127), ("SRC1", V + 3)]),
+                ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 3), ("SSRC0", 126)]),
+                ("S_FF1_I32_B64", "ENC_SOP1", &[("SDST", 7), ("SSRC0", 126)]),
+            ]);
+        } else {
+            p.extend_from_slice(&[
+                ("S_BCNT1_I32_B32", "ENC_SOP1", &[("SDST", 3), ("SSRC0", 126)]),
+                ("S_FF1_I32_B32", "ENC_SOP1", &[("SDST", 7), ("SSRC0", 126)]),
+            ]);
+        }
+        p.push(ENDPGM);
+        p
+    }
+
+    /// A waterfall loop: each pass takes the first lane's key (readfirstlane), the lanes with
+    /// that key do the work and leave; the readfirstlane is in a block lanes leave one by one.
+    fn waterfall(wave64: bool) -> Vec<I> {
+        let w: [I; 4] = if wave64 {
+            [
+                ("S_MOV_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 126)]),
+                ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 106)]),
+                ("S_XOR_B64", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 4)]),
+                ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 0)]),
+            ]
+        } else {
+            [
+                ("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 126)]),
+                ("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 106)]),
+                ("S_XOR_B32", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 4)]),
+                ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 0)]),
+            ]
+        };
+        vec![
+            ("V_AND_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 131), ("VSRC1", 0)]),
+            w[0],
+            ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", V + 2)]),
+            ("V_CMP_EQ_U32", "ENC_VOPC", &[("SRC0", 2), ("VSRC1", 2)]),
+            w[1],
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 3), ("SRC0", 2), ("VSRC1", 3)]),
+            w[2],
+            ("S_CBRANCH_EXECNZ", "ENC_SOPP", &[("SIMM16", 0xFFFA)]),
+            w[3],
+            ENDPGM,
+        ]
+    }
+
+    /// The lowering (on the CPU) and the HLSL path (on the GPU) give the same registers.
+    fn agrees_with_hlsl(name: &str, lines: &[I], wave64: bool, skip: &[usize]) {
+        use super::super::{dxc, runner, translate, Options};
+        let lanes = if wave64 { 64 } else { 32 };
+        let bytes: Vec<u8> = lines.iter().flat_map(|(n, e, f)| rdna2::encode(n, e, f, None).unwrap()).collect();
+        let (s, v) = state(lanes);
+        let mut st = runner::KernelState::default();
+        st.sgpr.copy_from_slice(&s);
+        for (l, regs) in v.iter().enumerate() {
+            st.vgpr[l][..regs.len()].copy_from_slice(regs);
+        }
+        let t = translate(&bytes, &Options { wave64, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{name}: {:?}", t.unsupported_why);
+        let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+        let gpu = runner::run(&dxil, &st, &[]).unwrap();
+        let (cs, cv) = run(lines, wave64, &s, &v);
+        let insts = decode(lines);
+        let (_, stale) = lower_kernel(&insts, wave64, Interp::default()).unwrap();
+        let mut sregs: Vec<usize> = vec![106, 126];
+        let mut vregs: Vec<usize> = Vec::new();
+        for d in &insts {
+            let (r, w) = rdna2::sgpr_uses(d);
+            sregs.extend(r.iter().chain(&w).map(|&x| x as usize).filter(|&x| x < 125));
+            let (r, w) = rdna2::vgpr_uses(d);
+            vregs.extend(r.iter().chain(&w).map(|&x| x as usize));
+        }
+        if wave64 {
+            sregs.extend([107, 127]);
+        }
+        // (a stale wave64 mask is reported by its first register; the pair's second is stale too)
+        let stale_at = |r: usize| stale.contains(&(r as u8)) || (wave64 && r > 0 && r % 2 == 1 && stale.contains(&(r as u8 - 1)));
+        for &r in sregs.iter().filter(|&&r| !stale_at(r) && !skip.contains(&r)) {
+            assert_eq!(cs[r], gpu.sgpr[r], "{name}: s{r}");
+        }
+        for l in 0..lanes {
+            for &r in &vregs {
+                assert_eq!(cv[l][r], gpu.vgpr[l][r], "{name}: lane {l} v{r}");
+            }
+        }
+    }
+
+    #[test]
+    fn cross_lane_reads_on_the_cpu() {
+        for wave64 in [false, true] {
+            let lanes = if wave64 { 64 } else { 32 };
+            let (s, v) = state(lanes);
+            let (s, v) = run(&lane_reads(wave64), wave64, &s, &v);
+            assert_eq!(s[2], 5, "readfirstlane: the first lane in EXEC");
+            assert_eq!(s[3], lanes as u32 - 5, "s_bcnt1 of EXEC");
+            assert_eq!(s[4], 27, "readlane 9 of 3 * lane");
+            assert_eq!(s[7], 5, "s_ff1 of EXEC");
+            for (l, r) in v.iter().enumerate() {
+                let (l32, active) = (l as u32, l > 4);
+                assert_eq!(r[3], if active { l32 - 5 } else { 0 }, "lane {l}: mbcnt");
+                assert_eq!(r[5], if l == 2 { 5 } else { 0 }, "lane {l}: writelane, whatever EXEC holds");
+                // row_shr:1, bound_ctrl: 0 at a row's first lane or from a lane outside EXEC
+                let want = if !active || l % 16 == 0 || l - 1 <= 4 { 0 } else { 3 * (l32 - 1) };
+                assert_eq!(r[6], want, "lane {l}: DPP16 row_shr");
+                let rev = (l32 & !7) | (7 - (l32 & 7));
+                let want = if active { l32 + if rev > 4 { 3 * rev } else { 0 } } else { 0 };
+                assert_eq!(r[8], want, "lane {l}: DPP8");
+                let x = l32 ^ 1;
+                assert_eq!(r[10], if active && x > 4 { 3 * x } else { 0 }, "lane {l}: ds_swizzle xor 1");
+            }
+        }
+    }
+
+    #[test]
+    fn a_waterfall_loop_reads_the_first_lane_of_each_pass() {
+        for wave64 in [false, true] {
+            let lanes = if wave64 { 64 } else { 32 };
+            let (s, v) = state(lanes);
+            let (_, v) = run(&waterfall(wave64), wave64, &s, &v);
+            for (l, r) in v.iter().enumerate() {
+                assert_eq!(r[3], l as u32 & 3, "lane {l}");
+            }
+        }
+        // a lane of any lane, where some lanes have left: refused
+        let mut lines = waterfall(false);
+        lines.insert(3, ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 9), ("SRC0", V + 2), ("SRC1", 129)]));
+        lines[8] = ("S_CBRANCH_EXECNZ", "ENC_SOPP", &[("SIMM16", 0xFFF8)]);
+        let err = lower_kernel(&decode(&lines), false, Interp::default()).err().expect("refused");
+        assert!(err.contains("some lanes are elsewhere"), "{err}");
+    }
+
+    #[test]
+    fn cross_lane_reads_agree_with_the_hlsl_path_on_the_gpu() {
+        use super::super::{dxc, runner};
+        if runner::adapter().is_err() || dxc::location().is_err() {
+            runner::skip_test(if runner::adapter().is_err() { "no GPU" } else { "no DXC" });
+            return;
+        }
+        agrees_with_hlsl("lane reads, wave32", &lane_reads(false), false, &[]);
+        // s2 and the saved EXEC s4 after the loop: the last pass's on the console; each lane's own
+        // last pass's in the lowering (written where lanes leave one by one; not refused yet)
+        agrees_with_hlsl("waterfall, wave32", &waterfall(false), false, &[2, 4]);
+        if runner::wave64_supported() != Ok(true) {
+            runner::skip_test("no wave64");
+            return;
+        }
+        agrees_with_hlsl("lane reads, wave64", &lane_reads(true), true, &[]);
+        agrees_with_hlsl("waterfall, wave64", &waterfall(true), true, &[2, 4, 5]);
     }
 }
