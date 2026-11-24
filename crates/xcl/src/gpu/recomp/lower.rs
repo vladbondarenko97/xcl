@@ -1111,7 +1111,7 @@ impl<I: Ir> Lower<'_, I> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::HashMap;
 
@@ -1418,12 +1418,12 @@ mod tests {
         }
     }
 
-    type I = (&'static str, &'static str, &'static [(&'static str, u64)]);
+    pub(crate) type I = (&'static str, &'static str, &'static [(&'static str, u64)]);
     const V: u64 = 256;
     const ENDPGM: I = ("S_ENDPGM", "ENC_SOPP", &[("SIMM16", 0)]);
 
     // wave32 programs shared by the CPU tests and the comparison with the HLSL path
-    const STRAIGHT: &[I] = &[
+    pub(crate) const STRAIGHT: &[I] = &[
         ("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 133)]),
         ("S_ADD_U32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 0), ("SSRC1", 0)]),
         ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 1)]),
@@ -1432,7 +1432,7 @@ mod tests {
     ];
     /// v_cmp_gt_u32 vcc, 16, v0; s_and_saveexec s0, vcc; s_cbranch_execz L; v_mov v1, 7;
     /// L: s_or exec, exec, s0; v_add v2, v1, 1
-    const SKIPPED_IF: &[I] = &[
+    pub(crate) const SKIPPED_IF: &[I] = &[
         ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)]),
         ("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]),
         ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 1)]),
@@ -1443,7 +1443,7 @@ mod tests {
     ];
     /// s_mov s0, exec; L: v_add v1, v1, 1; v_cmp_ge_u32 vcc, v1, v0; exec &= ~vcc;
     /// s_cbranch_execnz L; exec |= s0  →  v1 = max(1, lane)
-    const LEAVING_LOOP: &[I] = &[
+    pub(crate) const LEAVING_LOOP: &[I] = &[
         ("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 126)]),
         ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 129), ("VSRC1", 1)]),
         ("V_CMP_GE_U32", "ENC_VOPC", &[("SRC0", V + 1), ("VSRC1", 0)]),
@@ -1453,7 +1453,7 @@ mod tests {
         ENDPGM,
     ];
     /// s1 = 0; L: s1 += 3; v1 += 1; s_cmp_lt_u32 s1, 12; s_cbranch_scc1 L
-    const UNIFORM_LOOP: &[I] = &[
+    pub(crate) const UNIFORM_LOOP: &[I] = &[
         ("S_MOV_B32", "ENC_SOP1", &[("SDST", 1), ("SSRC0", 128)]),
         ("S_ADD_U32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 1), ("SSRC1", 131)]),
         ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 129), ("VSRC1", 1)]),
@@ -1464,7 +1464,7 @@ mod tests {
 
     /// v1 = 4·lane; s[4:5] = mem[2..4]; v2 = mem[lane] + s4; then lanes below 16 store v2 at
     /// mem[64 + lane] (a guarded store: no skip branch), and every lane stores v0 at mem[128 + lane]
-    const MEMORY: &[I] = &[
+    pub(crate) const MEMORY: &[I] = &[
         ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 130), ("VSRC1", 0)]),
         ("S_LOAD_DWORDX2", "ENC_SMEM", &[("SDATA", 4), ("SBASE", 0), ("OFFSET", 8), ("SOFFSET", 125)]),
         ("GLOBAL_LOAD_DWORD", "ENC_FLAT_GLBL", &[("VDST", 2), ("ADDR", 1), ("SADDR", 125), ("OFFSET", 0)]),
@@ -1479,7 +1479,7 @@ mod tests {
 
     /// A compute program: 64 threads, user SGPRs s0–s1, the group id x in s2;
     /// mem[64·group + thread] = 3·thread + s0 + group
-    const COMPUTE: &[I] = &[
+    pub(crate) const COMPUTE: &[I] = &[
         ("S_MUL_I32", "ENC_SOP2", &[("SDST", 3), ("SSRC0", 2), ("SSRC1", 192)]),
         ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 3), ("VSRC1", 0)]),
         ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 130), ("VSRC1", 2)]),
@@ -1491,12 +1491,12 @@ mod tests {
         ENDPGM,
     ];
 
-    fn compute_cs() -> crate::gpu::recomp::CsInterface {
+    pub(crate) fn compute_cs() -> crate::gpu::recomp::CsInterface {
         crate::gpu::recomp::CsInterface { threads: [64, 1, 1], user_sgprs: 2, tgid: [true, false, false], tg_size: false, tid_components: 1 }
     }
 
     /// A compute program run on the CPU over `groups` groups (wave32): the memory after.
-    fn run_compute(lines: &[I], cs: &crate::gpu::recomp::CsInterface, groups: u32, sgprs: &[u32], mem: &[u32]) -> Vec<u32> {
+    pub(crate) fn run_compute(lines: &[I], cs: &crate::gpu::recomp::CsInterface, groups: u32, sgprs: &[u32], mem: &[u32]) -> Vec<u32> {
         let ir = lower_compute(&decode(lines), cs, false, Interp::default()).unwrap_or_else(|e| panic!("{e}"));
         let mut io = vec![0u32; KERNEL_SGPRS];
         io[..sgprs.len()].copy_from_slice(sgprs);
@@ -1510,11 +1510,11 @@ mod tests {
         mem
     }
 
-    fn memory_image() -> Vec<u32> {
+    pub(crate) fn memory_image() -> Vec<u32> {
         (0..256).map(|i| 1000 + i).collect()
     }
 
-    fn decode(lines: &[I]) -> Vec<Decoded> {
+    pub(crate) fn decode(lines: &[I]) -> Vec<Decoded> {
         let bytes: Vec<u8> = lines.iter().flat_map(|(n, e, f)| rdna2::encode(n, e, f, None).unwrap()).collect();
         let mut out = Vec::new();
         let mut off = 0;
@@ -1533,7 +1533,7 @@ mod tests {
     }
 
     /// … with the flat memory too: (sgpr, vgpr[lane], memory after).
-    fn run_mem(lines: &[I], wave64: bool, sgpr: &[u32], vgpr: &[Vec<u32>], mem: &[u32]) -> (Vec<u32>, Vec<Vec<u32>>, Vec<u32>) {
+    pub(crate) fn run_mem(lines: &[I], wave64: bool, sgpr: &[u32], vgpr: &[Vec<u32>], mem: &[u32]) -> (Vec<u32>, Vec<Vec<u32>>, Vec<u32>) {
         let insts = decode(lines);
         let (ir, _) = lower_kernel(&insts, wave64, Interp::default()).unwrap_or_else(|e| panic!("{e}"));
         let lanes = if wave64 { 64 } else { 32 };
@@ -1549,7 +1549,7 @@ mod tests {
         (res[..KERNEL_SGPRS].to_vec(), v, mem)
     }
 
-    fn state(lanes: usize) -> (Vec<u32>, Vec<Vec<u32>>) {
+    pub(crate) fn state(lanes: usize) -> (Vec<u32>, Vec<Vec<u32>>) {
         let mut s = vec![0u32; KERNEL_SGPRS];
         s[126] = u32::MAX;
         s[127] = u32::MAX;
