@@ -3731,6 +3731,42 @@ pub(crate) mod tests {
         assert!(e.contains("split form"), "{e}");
     }
 
+    /// The split form's spin exchange (two console waves per group) makes blocks: a lane read
+    /// through it, ahead of a branch, leaves its `Ir` block in the last of them, so the phi
+    /// at the join takes its value from there. Each thread stores its console wave's first
+    /// thread id (`readfirstlane`), or 7 where that is not 0 (the branch's other arm).
+    #[test]
+    fn a_lane_read_through_the_spin_exchange_ends_its_block() {
+        use super::super::{lower_dxil, runner};
+        const READ_THEN_BRANCH: &[I] = &[
+            ("S_LSHL_B32", "ENC_SOP2", &[("SDST", 3), ("SSRC0", 2), ("SSRC1", 135)]),
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 3), ("VSRC1", 0)]),
+            ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 8), ("SRC0", 130), ("VSRC1", 4)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 9), ("SRC0", 128)]),
+            ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V)]),
+            ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 10), ("SSRC1", 128)]),
+            ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)]),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 135)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 10)]),
+            ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 8), ("DATA", 7), ("SADDR", 125), ("OFFSET", 0)]),
+            ENDPGM,
+        ];
+        let big = crate::gpu::recomp::CsInterface { threads: [128, 1, 1], ..compute_cs() };
+        let dxil = lower_dxil::compute_split(&decode(READ_THEN_BRANCH), &big).unwrap();
+        if crate::gpu::dxil::validate::validator_supported() {
+            crate::gpu::dxil::validate::validate(&dxil).unwrap_or_else(|e| panic!("{e}"));
+        }
+        if !gpu_waves() {
+            runner::skip_test("no GPU with 32-lane waves");
+            return;
+        }
+        let mem = vec![0u32; 256];
+        let gpu = runner::dispatch(&dxil, [2, 1, 1], &[100, 0], &mem).unwrap();
+        let cpu = run_compute_waves(READ_THEN_BRANCH, &big, true, 2, &[100, 0], &mem);
+        assert_eq!(&gpu[..256], &cpu[..256], "two console waves per group");
+        assert!((0..256).all(|t| cpu[t] == if t % 128 < 64 { 0 } else { 7 }), "{:?}", &cpu[..256]);
+    }
+
     #[test]
     fn scalar_and_vector_memory_with_a_guarded_store() {
         let (s, v) = state(32);

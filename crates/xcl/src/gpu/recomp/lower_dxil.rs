@@ -228,8 +228,10 @@ impl Ir for DxilIr {
     }
     fn ballot(&mut self, c: Value) -> [Value; 2] {
         if self.lw.split {
-            // this half's word from the hardware, the other's through the exchange
+            // this half's word from the hardware, the other's through the exchange (the spin
+            // exchange's blocks end the `Ir` block in the last of them, as in `foreign`)
             let (lo, hi) = self.lw.ballot(c);
+            self.tails[self.cur] = self.lw.cur();
             return [lo, hi];
         }
         let w = self.lw.s.wave_ballot(c);
@@ -282,7 +284,9 @@ impl Ir for DxilIr {
         if self.lw.split {
             // the lowering's lane reads take the same lane in every lane (readlane,
             // readfirstlane, writelane's source)
-            return self.lw.read_lane_uniform(v, lane);
+            let r = self.lw.read_lane_uniform(v, lane);
+            self.tails[self.cur] = self.lw.cur();
+            return r;
         }
         self.lw.s.wave_read_lane_at(v, lane)
     }
