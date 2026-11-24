@@ -13,6 +13,12 @@
 //! - a mask as a number is the ballot of its bits, which counts the lanes that are here: exact
 //!   for EXEC (a lane elsewhere is outside it), and for any mask where every lane is here.
 //!
+//! DPP, permlane(x)16, ds_swizzle and `v_mbcnt_hi` only need this lane's 32-lane half, so they
+//! use `Ir::read_lane_half` / `Ir::ballot_half`; readfirstlane, readlane, writelane, `v_mbcnt_lo`
+//! and a mask as a number need the whole wave (`read_lane`, `ballot`). With one hardware wave per
+//! console wave they are the same; a wave64 split into two 32-lane hardware waves exchanges data
+//! between the halves only for the whole-wave forms.
+//!
 //! Lanes outside EXEC when a kernel-mode program starts leave at once (`lower_kernel`), so a
 //! read of one of those is not the console's; compute waves start with every lane in EXEC.
 
@@ -41,20 +47,26 @@ impl<I: Ir> Lower<'_, I> {
         (self.wave64 && r > 0 && self.holds_mask(b, r - 1)).then_some((r - 1, true))
     }
 
-    /// The mask in s<r> as numbers (lanes 0–31, 32–63): the ballot of its bits.
-    fn mask_words(&mut self, b: usize, r: u8) -> R<[I::V; 2]> {
+    /// The mask in s<r> as numbers (lanes 0–31, 32–63): the ballot of its bits; with `half`,
+    /// only this lane's half of it is right (`Ir::ballot_half`).
+    fn mask_words(&mut self, b: usize, r: u8, half: bool) -> R<[I::V; 2]> {
         if r != EXEC {
             self.all_lanes(b, "a mask read as a number")?;
         }
         let bit = self.read_bit(b, r)?;
-        let [lo, hi] = self.ir.ballot(bit);
+        let [lo, hi] = if half { self.ir.ballot_half(bit) } else { self.ir.ballot(bit) };
         Ok(if self.wave64 { [lo, hi] } else { [lo, self.ir.int(0)] })
     }
 
     /// A 32-bit scalar operand as a number, also where it holds (half of) a mask.
     fn word(&mut self, b: usize, d: &Decoded, code: u64) -> R<I::V> {
+        self.word_in(b, d, code, false)
+    }
+
+    /// `word`; with `half`, a mask's word is only right for the lanes of the half it covers.
+    fn word_in(&mut self, b: usize, d: &Decoded, code: u64, half: bool) -> R<I::V> {
         match self.mask_reg(b, code) {
-            Some((r, hi)) => Ok(self.mask_words(b, r)?[hi as usize]),
+            Some((r, hi)) => Ok(self.mask_words(b, r, half)?[hi as usize]),
             None => self.src(b, d, code),
         }
     }
@@ -62,7 +74,7 @@ impl<I: Ir> Lower<'_, I> {
     /// A 64-bit scalar operand as numbers, also where it holds a mask.
     fn words(&mut self, b: usize, d: &Decoded, code: u64) -> R<[I::V; 2]> {
         match self.mask_reg(b, code) {
-            Some((r, false)) => self.mask_words(b, r),
+            Some((r, false)) => self.mask_words(b, r, false),
             Some((_, true)) => Err("a 64-bit operand across two masks".into()),
             None => {
                 let (lo, hi) = self.src64(b, d, code)?;
@@ -104,26 +116,27 @@ impl<I: Ir> Lower<'_, I> {
         self.ir.icmp(Cmp::Ne, w, z)
     }
 
-    /// The lanes in EXEC, as numbers.
-    fn exec_words(&mut self, b: usize) -> R<[I::V; 2]> {
+    /// The lanes in EXEC, as numbers; with `half`, only this lane's half is right.
+    fn exec_words(&mut self, b: usize, half: bool) -> R<[I::V; 2]> {
         let e = self.read_bit(b, EXEC)?;
-        let [lo, hi] = self.ir.ballot(e);
+        let [lo, hi] = if half { self.ir.ballot_half(e) } else { self.ir.ballot(e) };
         Ok([lo, if self.wave64 { hi } else { self.ir.int(0) }])
     }
 
-    /// `v` of lane `l` if that lane is in EXEC (or `inactive_too`); whether it was.
+    /// `v` of lane `l` (in this lane's 32-lane half) if that lane is in EXEC (or
+    /// `inactive_too`); whether it was.
     fn read_from(&mut self, b: usize, v: I::V, l: I::V, inactive_too: bool, what: &str) -> R<(I::V, I::V)> {
         let ok = if inactive_too {
             self.all_lanes(b, what)?;
             self.ir.boolean(true)
         } else {
-            let e = self.exec_words(b)?;
+            let e = self.exec_words(b, true)?;
             self.bit_at(e, l)
         };
         // a lane outside EXEC may be elsewhere: read this lane's own value instead, unused
         let me = self.lane();
         let at = self.ir.select(ok, l, me);
-        Ok((self.ir.read_lane(v, at), ok))
+        Ok((self.ir.read_lane_half(v, at), ok))
     }
 
     fn c(&mut self, v: u32) -> I::V {
@@ -278,7 +291,7 @@ impl<I: Ir> Lower<'_, I> {
             "V_READFIRSTLANE_B32" => {
                 let v = self.src(b, d, s0)?;
                 let r = if s0 >= 256 {
-                    let e = self.exec_words(b)?;
+                    let e = self.exec_words(b, false)?;
                     let l = self.first_set(e, 0);
                     self.ir.read_lane(v, l)
                 } else {
@@ -307,7 +320,10 @@ impl<I: Ir> Lower<'_, I> {
                 self.ssa.write(b, Var::V(vdst as u16), v);
             }
             "V_MBCNT_LO_U32_B32" | "V_MBCNT_HI_U32_B32" => {
-                let (m, add) = (self.word(b, d, s0)?, self.src(b, d, s1)?);
+                // mbcnt_hi counts the upper lanes' own half only (0 below lane 32); mbcnt_lo
+                // gives the upper lanes all of the lower half
+                let hi_half = name == "V_MBCNT_HI_U32_B32";
+                let (m, add) = (self.word_in(b, d, s0, hi_half)?, self.src(b, d, s1)?);
                 // the lanes below this one, in this half of the mask
                 let me = self.lane();
                 let (c31, c32, one, z, all) = (self.c(31), self.c(32), self.c(1), self.c(0), self.c(u32::MAX));

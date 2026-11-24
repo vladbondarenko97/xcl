@@ -71,9 +71,14 @@ pub trait Ir: Sink {
     fn thread_id(&mut self, k: u32) -> Self::V;
     /// the wave's ballot of `c`: lanes 0–31, 32–63
     fn ballot(&mut self, c: Self::V) -> [Self::V; 2];
+    /// `ballot` where only the word of this lane's 32-lane half is used (the other may be
+    /// anything): a wave64 split into two 32-lane hardware waves needs no exchange for it
+    fn ballot_half(&mut self, c: Self::V) -> [Self::V; 2];
     /// `v` as lane `lane` holds it (`WaveReadLaneAt`); `lane` may differ between lanes and is
     /// always one running this instruction too
     fn read_lane(&mut self, v: Self::V, lane: Self::V) -> Self::V;
+    /// `read_lane` of a lane in this lane's 32-lane half (DPP, permlane, swizzle)
+    fn read_lane_half(&mut self, v: Self::V, lane: Self::V) -> Self::V;
     /// the number of bits set in `v` (`countbits`)
     fn count_bits(&mut self, v: Self::V) -> Self::V;
     fn io_load(&mut self, dword: Self::V) -> Self::V;
@@ -1235,6 +1240,9 @@ pub(crate) mod tests {
         ThreadId(u32),
         Ballot(u32, usize),
         ReadLane(u32, u32),
+        /// as `Ballot` and `ReadLane`, but the lowering may use only its own 32-lane half's part
+        BallotHalf(u32, usize),
+        ReadLaneHalf(u32, u32),
         CountBits(u32),
         IoLoad(u32),
         ResStore(u32, u32),
@@ -1351,8 +1359,14 @@ pub(crate) mod tests {
         fn ballot(&mut self, c: u32) -> [u32; 2] {
             [self.push(Ins::Ballot(c, 0)), self.push(Ins::Ballot(c, 1))]
         }
+        fn ballot_half(&mut self, c: u32) -> [u32; 2] {
+            [self.push(Ins::BallotHalf(c, 0)), self.push(Ins::BallotHalf(c, 1))]
+        }
         fn read_lane(&mut self, v: u32, lane: u32) -> u32 {
             self.push(Ins::ReadLane(v, lane))
+        }
+        fn read_lane_half(&mut self, v: u32, lane: u32) -> u32 {
+            self.push(Ins::ReadLaneHalf(v, lane))
         }
         fn count_bits(&mut self, v: u32) -> u32 {
             self.push(Ins::CountBits(v))
@@ -1473,7 +1487,7 @@ pub(crate) mod tests {
                                 Ins::Lane => Some(lane as u32),
                                 Ins::GroupId(k) => Some(group[*k as usize]),
                                 Ins::ThreadId(k) => Some(if *k == 0 { base + lane as u32 } else { 0 }),
-                                Ins::Ballot(..) | Ins::ReadLane(..) => break,
+                                Ins::Ballot(..) | Ins::BallotHalf(..) | Ins::ReadLane(..) | Ins::ReadLaneHalf(..) => break,
                                 Ins::CountBits(v) => Some(g(v).count_ones()),
                                 Ins::IoLoad(a) => Some(io[g(a) as usize]),
                                 Ins::MemLoad(a) => Some(mem.get((g(a) / 4) as usize).copied().unwrap_or(0)),
@@ -1519,20 +1533,27 @@ pub(crate) mod tests {
                 let group: Vec<usize> = (0..ls.len()).filter(|&l| !ls[l].done && (ls[l].block, ls[l].at) == (b, at)).collect();
                 let (id, ins) = &self.blocks[b].0[at];
                 let out: Vec<u32> = match ins {
-                    Ins::Ballot(c, half) => {
+                    Ins::Ballot(c, half) | Ins::BallotHalf(c, half) => {
                         let mut bits = 0u64;
                         for &l in &group {
                             if self.value(&ls[l].env, *c) != 0 {
                                 bits |= 1 << l;
                             }
                         }
-                        vec![(bits >> (32 * half)) as u32; group.len()]
+                        let word = (bits >> (32 * half)) as u32;
+                        // the half-local form: the other half's word is garbage, so a lowering
+                        // that reads it gets a wrong result here
+                        let local = matches!(ins, Ins::BallotHalf(..));
+                        group.iter().map(|&l| if local && l / 32 != *half { 0xA5A5_0000 | l as u32 } else { word }).collect()
                     }
-                    Ins::ReadLane(v, from) => group
+                    Ins::ReadLane(v, from) | Ins::ReadLaneHalf(v, from) => group
                         .iter()
                         .map(|&l| {
                             let src = self.value(&ls[l].env, *from) as usize;
                             assert!(group.contains(&src), "lane {l} reads lane {src}, which is elsewhere");
+                            if matches!(ins, Ins::ReadLaneHalf(..)) {
+                                assert_eq!(src / 32, l / 32, "lane {l} reads lane {src} of the other half");
+                            }
                             self.value(&ls[src].env, *v)
                         })
                         .collect(),

@@ -127,8 +127,16 @@ impl Ir for DxilIr {
         let w = self.s.wave_ballot(c);
         [w[0], w[1]]
     }
+    // one hardware wave per console wave (native wave64, or wave32): the half-local forms are
+    // the same operations
+    fn ballot_half(&mut self, c: Value) -> [Value; 2] {
+        self.ballot(c)
+    }
     fn read_lane(&mut self, v: Value, lane: Value) -> Value {
         self.s.wave_read_lane_at(v, lane)
+    }
+    fn read_lane_half(&mut self, v: Value, lane: Value) -> Value {
+        self.read_lane(v, lane)
     }
     fn count_bits(&mut self, v: Value) -> Value {
         self.s.bit_count(crate::gpu::dxil::ops::BitCount::Countbits, v)
