@@ -362,11 +362,50 @@ impl TilePool {
     }
 }
 
-/// Allocate one 64 MiB default heap for `Pages`.
-unsafe fn alloc_pool_heap(dev: &ID3D12Device) -> Option<ID3D12Heap> {
+/// MB a new pool heap leaves under the OS's local video memory budget for the process
+/// (`XCL_VRAM_HEADROOM_MB`, default 1024): what the title's own sparse pools, arenas and the
+/// driver still take in video memory after the pages stop growing there.
+fn vram_headroom() -> u64 {
+    std::env::var("XCL_VRAM_HEADROOM_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1024) << 20
+}
+
+/// Where a new pool heap of `bytes` goes with `usage` bytes of local video memory in use and
+/// `budget` given (`DXGI_QUERY_VIDEO_MEMORY_INFO`): video memory while it stays `headroom` under
+/// the budget, else system memory (L0, read by the GPU over the bus). Past the budget video
+/// memory is not refused, it is over-committed: the OS pages it in and out under the title's
+/// work (a 12 GB card at 15 GB of local use: 28 s UpdateTileMappings calls, then the device
+/// removed). No budget known: video memory.
+fn pool_heap_properties(usage: u64, budget: u64, bytes: u64, headroom: u64) -> D3D12_HEAP_PROPERTIES {
+    if budget == 0 || usage.saturating_add(bytes).saturating_add(headroom) <= budget {
+        return D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+    }
+    D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_CUSTOM, CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE, MemoryPoolPreference: D3D12_MEMORY_POOL_L0, ..Default::default() }
+}
+
+/// The process's local video memory on `adapter`: (in use, budget).
+unsafe fn local_video_memory(adapter: &windows::Win32::Graphics::Dxgi::IDXGIAdapter3) -> Option<(u64, u64)> {
+    use windows::Win32::Graphics::Dxgi::*;
+    let mut i = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+    adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut i).ok()?;
+    Some((i.CurrentUsage, i.Budget))
+}
+
+/// Allocate one 64 MiB heap for `Pages`: video memory while the budget allows (`pool_heap_properties`).
+// ponytail: a heap placed in system memory stays there; textures on it do not move back when video memory frees up
+unsafe fn alloc_pool_heap(dev: &ID3D12Device, adapter: Option<&windows::Win32::Graphics::Dxgi::IDXGIAdapter3>, headroom: u64) -> Option<ID3D12Heap> {
+    let bytes = POOL_PAGES as u64 * PAGE as u64;
+    let (usage, budget) = adapter.and_then(|a| local_video_memory(a)).unwrap_or((0, 0));
+    let properties = pool_heap_properties(usage, budget, bytes, headroom);
+    if properties.Type == D3D12_HEAP_TYPE_CUSTOM {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            crate::xlog_info!("D3D12.X: local video memory {} of {} MB budget: pool heap {n} of title texture pages in system memory", usage >> 20, budget >> 20);
+        }
+    }
     let desc = D3D12_HEAP_DESC {
-        SizeInBytes: POOL_PAGES as u64 * PAGE as u64,
-        Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+        SizeInBytes: bytes,
+        Properties: properties,
         Alignment: 0,
         // every kind of texture (resource heap tier 2: the only flags for both)
         Flags: D3D12_HEAP_FLAG_NONE,
@@ -400,6 +439,9 @@ struct Pages {
     waited: std::collections::HashMap<usize, u64>,
     /// cached `reservable()` answers for `(DXGI_FORMAT, SampleCount)` on this device
     reservable_cache: std::collections::HashMap<(i32, u32), bool>,
+    /// the device's adapter, for its video memory budget (`alloc_pool_heap`)
+    adapter: Option<windows::Win32::Graphics::Dxgi::IDXGIAdapter3>,
+    headroom: u64,
     /// reusable scratch buffers for `map()`
     scratch_heaps: Vec<u32>,
     scratch_flags: Vec<D3D12_TILE_RANGE_FLAGS>,
@@ -426,6 +468,9 @@ impl Pages {
         let _ = queue.SetName(windows::core::w!("xcl vram tile-mapping queue"));
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
         crate::xlog_info!("D3D12.X: textures in title memory: tiled resources on 64 KiB pages of video memory, one per page of the title's");
+        let adapter = windows::Win32::Graphics::Dxgi::CreateDXGIFactory1::<windows::Win32::Graphics::Dxgi::IDXGIFactory4>()
+            .and_then(|f| f.EnumAdapterByLuid(dev.GetAdapterLuid()))
+            .ok();
         Some(Pages {
             queue,
             fence,
@@ -438,6 +483,8 @@ impl Pages {
             targets: std::collections::HashMap::new(),
             waited: std::collections::HashMap::new(),
             reservable_cache: std::collections::HashMap::new(),
+            adapter,
+            headroom: vram_headroom(),
             scratch_heaps: Vec::new(),
             scratch_flags: Vec::new(),
             scratch_offsets: Vec::new(),
@@ -575,8 +622,9 @@ impl Pages {
 
         let pools = &mut self.pools;
         let pool = &mut self.pool;
+        let (adapter, headroom) = (self.adapter.as_ref(), self.headroom);
         let fresh = pool.take_batch(missing, preferred, now, POOL_PAGES, || {
-            let heap = alloc_pool_heap(dev)?;
+            let heap = alloc_pool_heap(dev, adapter, headroom)?;
             pools.push(heap);
             Some(pools.len() as u32 - 1)
         })?;
@@ -926,6 +974,24 @@ mod tests {
     use std::time::{Duration, Instant};
 
     const MIB: usize = 1 << 20;
+
+    /// Pool heaps go in video memory while it stays the headroom under the budget, then in
+    /// system memory (L0); an adapter that gives no budget keeps them in video memory. The
+    /// RTX 3080 Ti case: 15.1 GB of local use against an ~11.5 GB budget took more DEFAULT heaps.
+    #[test]
+    fn pool_heaps_past_the_video_memory_budget_go_in_system_memory() {
+        const GIB: u64 = 1 << 30;
+        let heap = 64 * MIB as u64;
+        let in_vram = |p: D3D12_HEAP_PROPERTIES| p.Type == D3D12_HEAP_TYPE_DEFAULT;
+        assert!(in_vram(pool_heap_properties(6 * GIB, 11 * GIB + GIB / 2, heap, GIB)));
+        assert!(in_vram(pool_heap_properties(10 * GIB + GIB / 2 - heap, 11 * GIB + GIB / 2, heap, GIB)), "exactly at the headroom");
+        let over = pool_heap_properties(10 * GIB + GIB / 2, 11 * GIB + GIB / 2, heap, GIB);
+        assert_eq!(over.Type, D3D12_HEAP_TYPE_CUSTOM);
+        assert_eq!(over.CPUPageProperty, D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE);
+        assert_eq!(over.MemoryPoolPreference, D3D12_MEMORY_POOL_L0);
+        assert!(!in_vram(pool_heap_properties(15 * GIB, 11 * GIB + GIB / 2, heap, 0)));
+        assert!(in_vram(pool_heap_properties(15 * GIB, 0, heap, GIB)), "no budget known");
+    }
 
     /// One call per heap: its tiles in runs, the other heaps' skipped.
     #[test]
