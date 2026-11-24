@@ -312,6 +312,11 @@ struct RecompAgg {
     /// instructions, those still guarded, lane branches, uniform branches; failures by reason
     lanes: [usize; 6],
     lanes_failed: BTreeMap<String, usize>,
+    /// compute programs, per-lane DXIL (`lower_dxil`) vs #1426's per-instruction form: tried,
+    /// per-lane ok, per-instruction ok, both ok, per-lane bytes and per-instruction bytes where
+    /// both are ok; why the per-lane form refused (first words of the reason)
+    cs_forms: [usize; 6],
+    cs_lane_why: BTreeMap<String, usize>,
 }
 
 impl RecompAgg {
@@ -358,6 +363,12 @@ impl RecompAgg {
         for (k, v) in o.lanes_failed {
             *self.lanes_failed.entry(k).or_default() += v;
         }
+        for (a, b) in self.cs_forms.iter_mut().zip(o.cs_forms) {
+            *a += b;
+        }
+        for (k, v) in o.cs_lane_why {
+            *self.cs_lane_why.entry(k).or_default() += v;
+        }
     }
 
     fn add(&mut self, name: &str, code: &[u8], keep: usize, mode: recomp::Mode) {
@@ -396,6 +407,23 @@ impl RecompAgg {
                 }
             } else {
                 self.graphics_wave32 += 1;
+            }
+        }
+        if let recomp::Mode::Compute(cs) = &mode {
+            let lane = recomp::lower_dxil::compute_code(code, cs, wave64);
+            let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 };
+            let inst = crate::gpu::dxil::kernel::translate_compute(code, o, cs).map(|k| k.dxil);
+            self.cs_forms[0] += 1;
+            self.cs_forms[1] += lane.is_ok() as usize;
+            self.cs_forms[2] += inst.is_ok() as usize;
+            if let (Ok(a), Ok(b)) = (&lane, &inst) {
+                self.cs_forms[3] += 1;
+                self.cs_forms[4] += a.len();
+                self.cs_forms[5] += b.len();
+            }
+            if let Err(e) = &lane {
+                let key: String = e.split([':', '(']).next().unwrap_or("").split_whitespace().take(3).collect::<Vec<_>>().join(" ");
+                *self.cs_lane_why.entry(key).or_default() += 1;
             }
         }
         match recomp::lane_masks::analyze_code(code, wave64) {
@@ -1246,6 +1274,13 @@ fn print(path: &Path, what: &str, agg: Agg, top: usize, json: bool, t0: std::tim
         println!(
             "VS/PS and the wave size (the driver picks it): wave32 {} (handled – the halves of a 64-wide wave run separately), wave64 {}; hazards in 32-thread waves: {:?}; reads of lanes ≥ 32 resolved (32-lane GPUs): {:?}",
             rc.graphics_wave32, rc.graphics_wave64, rc.wave_hazards, rc.wave_resolved
+        );
+        let c = &rc.cs_forms;
+        let mut why: Vec<_> = rc.cs_lane_why.iter().collect();
+        why.sort_by(|a, b| b.1.cmp(a.1));
+        println!(
+            "compute programs, direct DXIL: {} tried; per-lane form {} ok, per-instruction form (#1426) {} ok; where both are ok ({}): per-lane {:.1} MB, per-instruction {:.1} MB of DXIL; per-lane refused for: {:?}",
+            c[0], c[1], c[2], c[3], c[4] as f64 / 1048576.0, c[5] as f64 / 1048576.0, &why[..why.len().min(15)]
         );
         let l = &rc.lanes;
         println!(

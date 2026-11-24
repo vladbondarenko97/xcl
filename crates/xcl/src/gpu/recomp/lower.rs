@@ -464,6 +464,9 @@ impl<'a, I: Ir> Lower<'a, I> {
                 self.write_scc(b, v);
             }
             "S_NOP" | "S_WAITCNT" | "S_WAITCNT_VSCNT" | "S_WAITCNT_VMCNT" | "S_WAITCNT_LGKMCNT" | "S_WAITCNT_EXPCNT" | "S_INST_PREFETCH" | "S_CLAUSE" => {}
+            // MODE (float rounding / denormals): only float instructions read it, and the
+            // lowering refuses every float instruction so far – revisit when floats come in
+            "S_SETREG_IMM32_B32" | "S_SETREG_B32" if self.sets_mode_only(d) => {}
             n => return Err(format!("unsupported {n}")),
         }
         Ok(())
@@ -481,6 +484,9 @@ impl<'a, I: Ir> Lower<'a, I> {
     }
 
     fn valu(&mut self, b: usize, d: &Decoded) -> R<()> {
+        if d.inst.name == "V_NOP" {
+            return Ok(());
+        }
         if matches!(d.variant, Variant::Dpp16 | Variant::Dpp8) {
             self.dpp(b, d)?;
         }
@@ -555,6 +561,35 @@ impl<'a, I: Ir> Lower<'a, I> {
                     "V_OR_B32" => self.ir.bin(Bin::Or, a, c),
                     "V_XOR_B32" => self.ir.bin(Bin::Xor, a, c),
                     "V_MUL_LO_U32" => self.ir.bin(Bin::Mul, a, c),
+                    // three-source integer ops (VOP3): shifts take the low 5 bits of their amount
+                    "V_LSHL_ADD_U32" | "V_ADD_LSHL_U32" | "V_LSHL_OR_B32" | "V_AND_OR_B32" | "V_OR3_B32" | "V_XOR3_B32" | "V_ADD3_U32" => {
+                        let e = self.src(b, d, fv("SRC2").unwrap_or(0))?;
+                        match name {
+                            "V_LSHL_ADD_U32" | "V_LSHL_OR_B32" => {
+                                let sh = self.ir.bin(Bin::And, c, c31);
+                                let x = self.ir.bin(Bin::Shl, a, sh);
+                                self.ir.bin(if name == "V_LSHL_ADD_U32" { Bin::Add } else { Bin::Or }, x, e)
+                            }
+                            "V_ADD_LSHL_U32" => {
+                                let x = self.ir.bin(Bin::Add, a, c);
+                                let sh = self.ir.bin(Bin::And, e, c31);
+                                self.ir.bin(Bin::Shl, x, sh)
+                            }
+                            "V_AND_OR_B32" => {
+                                let x = self.ir.bin(Bin::And, a, c);
+                                self.ir.bin(Bin::Or, x, e)
+                            }
+                            _ => {
+                                let op = match name {
+                                    "V_OR3_B32" => Bin::Or,
+                                    "V_XOR3_B32" => Bin::Xor,
+                                    _ => Bin::Add,
+                                };
+                                let x = self.ir.bin(op, a, c);
+                                self.ir.bin(op, x, e)
+                            }
+                        }
+                    }
                     "V_LSHLREV_B32" | "V_LSHRREV_B32" | "V_ASHRREV_I32" => {
                         let sh = self.ir.bin(Bin::And, a, c31);
                         let op = match name {
@@ -569,6 +604,11 @@ impl<'a, I: Ir> Lower<'a, I> {
             }
         };
         self.write_v(b, d, vdst as u16, v)
+    }
+
+    /// `s_setreg*` writing `HW_REG_MODE` (id 1 of its `SIMM16`) and nothing else.
+    fn sets_mode_only(&self, d: &Decoded) -> bool {
+        rdna2::field_value(d.enc, &d.words, "SIMM16").unwrap_or(0) & 0x3F == 1
     }
 
     /// `s_load_dword{,x2,x4,x8,x16}`: dwords of the flat memory into SGPRs, from

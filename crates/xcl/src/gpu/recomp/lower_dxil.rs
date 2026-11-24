@@ -171,6 +171,19 @@ pub fn kernel(insts: &[Decoded], wave64: bool) -> Result<(Vec<u8>, Vec<u8>), Str
     Ok((ir.s.finish([lanes, 1, 1], Some(lanes)), stale))
 }
 
+/// `compute` from the program's code (decoded, far jumps resolved).
+pub fn compute_code(code: &[u8], cs: &super::CsInterface, wave64: bool) -> Result<Vec<u8>, String> {
+    let mut insts = Vec::new();
+    let mut off = 0usize;
+    while off + 4 <= code.len() {
+        let d = crate::gpu::rdna2::decode(&code[off..], off as u64).map_err(|e| format!("cannot decode ({e:?})"))?;
+        off += d.len;
+        insts.push(d);
+    }
+    crate::gpu::rdna2::resolve_far_jumps(&mut insts);
+    compute(&insts, cs, wave64)
+}
+
 /// A compute program in its per-lane form, as a signed DXIL container.
 pub fn compute(insts: &[Decoded], cs: &super::CsInterface, wave64: bool) -> Result<Vec<u8>, String> {
     let ir = lower::lower_compute(insts, cs, wave64, DxilIr::new(false))?;
