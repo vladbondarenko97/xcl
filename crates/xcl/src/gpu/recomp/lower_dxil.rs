@@ -7,11 +7,11 @@
 //! construction finds trivial keeps its (identical) incoming values instead of being removed:
 //! the builder has no use replacement, and the driver folds such phis.
 
-use super::lower::{self, Bin, Cmp, FBin, FUn, Ir};
+use super::lower::{self, Bin, Cmp, FBin, FCmp, FUn, Ir};
 use super::ssa::{Sink, Var};
 use crate::gpu::dxil::container::Stage;
 use crate::gpu::dxil::module::{BinOp, Block, CastOp, Pred, Value};
-use crate::gpu::dxil::ops::{Binary, FUnary, Tertiary};
+use crate::gpu::dxil::ops::{Binary, FClass, FUnary, Tertiary};
 use crate::gpu::dxil::shader::{RawUav, Shader};
 use crate::gpu::rdna2::Decoded;
 
@@ -186,6 +186,21 @@ impl Ir for DxilIr {
         let r = self.s.tertiary(Tertiary::FMad, a, b, c);
         self.bits(r)
     }
+    fn fcmp(&mut self, c: FCmp, a: Value, b: Value) -> Value {
+        let (a, b) = (self.f(a), self.f(b));
+        let p = match c {
+            FCmp::Lt => Pred::FOLt,
+            FCmp::Eq => Pred::FOEq,
+            FCmp::Le => Pred::FOLe,
+            FCmp::Gt => Pred::FOGt,
+            FCmp::Ge => Pred::FOGe,
+        };
+        self.s.m.cmp(p, a, b)
+    }
+    fn is_nan(&mut self, a: Value) -> Value {
+        let a = self.f(a);
+        self.s.fclass(FClass::IsNaN, a)
+    }
     fn io_load(&mut self, dword: Value) -> Value {
         let a = self.bytes(dword);
         let io = self.io;
@@ -263,7 +278,7 @@ mod tests {
         if !gpu() {
             return;
         }
-        for (name, lines) in [("straight", STRAIGHT), ("skipped if", SKIPPED_IF), ("leaving loop", LEAVING_LOOP), ("uniform loop", UNIFORM_LOOP), ("memory", MEMORY), ("f32 arithmetic", F32_ARITHMETIC)] {
+        for (name, lines) in [("straight", STRAIGHT), ("skipped if", SKIPPED_IF), ("leaving loop", LEAVING_LOOP), ("uniform loop", UNIFORM_LOOP), ("memory", MEMORY), ("f32 arithmetic", F32_ARITHMETIC), ("f32 compares", F32_COMPARES)] {
             let insts = decode(lines);
             let (dxil, stale) = super::kernel(&insts, false).unwrap_or_else(|e| panic!("{name}: {e}"));
             let (s, v) = state(32);

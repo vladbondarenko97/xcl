@@ -63,6 +63,16 @@ pub enum FBin {
     Max,
 }
 
+/// Ordered f32 compares (false when either operand is NaN)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FCmp {
+    Lt,
+    Eq,
+    Le,
+    Gt,
+    Ge,
+}
+
 /// `Abs` and `Neg` as HLSL's `abs` / `-x`; `Sat` is `saturate` (NaN gives 0)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FUn {
@@ -105,6 +115,9 @@ pub trait Ir: Sink {
     fn fun(&mut self, op: FUn, a: Self::V) -> Self::V;
     /// HLSL's `mad` (DXIL `FMad`): fused or not, as the driver chooses
     fn fmad(&mut self, a: Self::V, b: Self::V, c: Self::V) -> Self::V;
+    /// `i1`: an ordered compare of the dwords as f32; whether a dword is a NaN
+    fn fcmp(&mut self, c: FCmp, a: Self::V, b: Self::V) -> Self::V;
+    fn is_nan(&mut self, a: Self::V) -> Self::V;
     fn io_load(&mut self, dword: Self::V) -> Self::V;
     fn res_store(&mut self, dword: Self::V, value: Self::V);
     /// the dword of the flat memory (`mem`, u2) at a byte address (a multiple of 4); out of
@@ -542,7 +555,14 @@ impl<'a, I: Ir> Lower<'a, I> {
         let fv = |f: &str| rdna2::field_value(d.enc, &d.words, f);
         let vop3 = d.enc.name.starts_with("ENC_VOP3") || d.enc.name.starts_with("VOP3");
         // the float modifiers are the f32 ops' (`f32_arith`); OP_SEL is no one's yet
-        let mods: &[&str] = if F32_ARITH.contains(&name) { &["OP_SEL"] } else { &["ABS", "NEG", "CLAMP", "OMOD", "OP_SEL"] };
+        let f32_cmp = name.starts_with("V_CMP") && name.ends_with("_F32");
+        let mods: &[&str] = if F32_ARITH.contains(&name) {
+            &["OP_SEL"]
+        } else if f32_cmp {
+            &["CLAMP", "OMOD", "OP_SEL"]
+        } else {
+            &["ABS", "NEG", "CLAMP", "OMOD", "OP_SEL"]
+        };
         if vop3 && mods.iter().any(|f| fv(f).unwrap_or(0) != 0) {
             return Err(format!("{name}: VOP3 modifiers"));
         }
@@ -557,21 +577,25 @@ impl<'a, I: Ir> Lower<'a, I> {
             };
             let (pred, ty) = cond.split_once('_').ok_or_else(|| format!("unsupported {name}"))?;
             let signed = match ty {
-                "U32" => false,
+                "U32" | "F32" => false,
                 "I32" => true,
                 _ => return Err(format!("unsupported {name}")),
             };
             let (a, c) = (self.src(b, d, s0)?, self.src(b, d, s1)?);
-            let c = match pred {
-                "EQ" => self.ir.icmp(Cmp::Eq, a, c),
-                "NE" => self.ir.icmp(Cmp::Ne, a, c),
-                "GT" => self.ir.icmp(if signed { Cmp::Sgt } else { Cmp::Ugt }, a, c),
-                "GE" => self.ir.icmp(if signed { Cmp::Sge } else { Cmp::Uge }, a, c),
-                "LT" => self.ir.icmp(if signed { Cmp::Slt } else { Cmp::Ult }, a, c),
-                "LE" => self.ir.icmp(if signed { Cmp::Sle } else { Cmp::Ule }, a, c),
-                "F" => self.ir.boolean(false),
-                "T" => self.ir.boolean(true),
-                _ => return Err(format!("unsupported {name}")),
+            let c = if ty == "F32" {
+                self.f32_cmp(d, vop3, pred, a, c).ok_or_else(|| format!("unsupported {name}"))?
+            } else {
+                match pred {
+                    "EQ" => self.ir.icmp(Cmp::Eq, a, c),
+                    "NE" => self.ir.icmp(Cmp::Ne, a, c),
+                    "GT" => self.ir.icmp(if signed { Cmp::Sgt } else { Cmp::Ugt }, a, c),
+                    "GE" => self.ir.icmp(if signed { Cmp::Sge } else { Cmp::Uge }, a, c),
+                    "LT" => self.ir.icmp(if signed { Cmp::Slt } else { Cmp::Ult }, a, c),
+                    "LE" => self.ir.icmp(if signed { Cmp::Sle } else { Cmp::Ule }, a, c),
+                    "F" => self.ir.boolean(false),
+                    "T" => self.ir.boolean(true),
+                    _ => return Err(format!("unsupported {name}")),
+                }
             };
             // the lane's result, 0 in inactive lanes
             let e = self.read_bit(b, EXEC)?;
@@ -690,6 +714,63 @@ impl<'a, I: Ir> Lower<'a, I> {
             }
         };
         Ok(if fv("CLAMP") == 1 { self.ir.fun(FUn::Sat, r) } else { r })
+    }
+
+    /// An f32 compare as the HLSL path writes it (`emit.rs` `float_compare`): the sources take
+    /// abs, then neg; NaN is tested explicitly, the ordered compares false and the unordered
+    /// ones (`N…`, `U`) true on it. `None` for a predicate it does not know (`CLASS`).
+    fn f32_cmp(&mut self, d: &Decoded, vop3: bool, pred: &str, a: I::V, c: I::V) -> Option<I::V> {
+        let fv = |f: &str| if vop3 { rdna2::field_value(d.enc, &d.words, f).unwrap_or(0) } else { 0 };
+        let mut x = [a, c];
+        for (i, v) in x.iter_mut().enumerate() {
+            if fv("ABS") >> i & 1 == 1 {
+                *v = self.ir.fun(FUn::Abs, *v);
+            }
+            if fv("NEG") >> i & 1 == 1 {
+                *v = self.ir.fun(FUn::Neg, *v);
+            }
+        }
+        let [a, c] = x;
+        let rel = |l: &mut Self, r: &str| -> Option<I::V> {
+            let p = match r {
+                "LT" => FCmp::Lt,
+                "EQ" => FCmp::Eq,
+                "LE" => FCmp::Le,
+                "GT" => FCmp::Gt,
+                "GE" => FCmp::Ge,
+                "LG" => {
+                    let (lt, gt) = (l.ir.fcmp(FCmp::Lt, a, c), l.ir.fcmp(FCmp::Gt, a, c));
+                    return Some(l.ir.bin(Bin::Or, lt, gt));
+                }
+                _ => return None,
+            };
+            Some(l.ir.fcmp(p, a, c))
+        };
+        let nan = |l: &mut Self| {
+            let (x, y) = (l.ir.is_nan(a), l.ir.is_nan(c));
+            l.ir.bin(Bin::Or, x, y)
+        };
+        Some(match pred {
+            "F" => self.ir.boolean(false),
+            "TRU" => self.ir.boolean(true),
+            "O" => {
+                let n = nan(self);
+                self.not(n)
+            }
+            "U" => nan(self),
+            p => match p.strip_prefix('N').and_then(|r| rel(self, r)) {
+                Some(r) => {
+                    let (n, nr) = (nan(self), self.not(r));
+                    self.ir.bin(Bin::Or, n, nr)
+                }
+                None => {
+                    let r = rel(self, p)?;
+                    let n = nan(self);
+                    let nn = self.not(n);
+                    self.ir.bin(Bin::And, nn, r)
+                }
+            },
+        })
     }
 
     /// `s_setreg*` writing `HW_REG_MODE` (id 1 of its `SIMM16`) and nothing else.
@@ -1328,6 +1409,8 @@ pub(crate) mod tests {
         FBin(FBin, u32, u32),
         FUn(FUn, u32),
         FMad(u32, u32, u32),
+        FCmp(FCmp, u32, u32),
+        IsNan(u32),
         IoLoad(u32),
         ResStore(u32, u32),
         MemLoad(u32),
@@ -1463,6 +1546,12 @@ pub(crate) mod tests {
         }
         fn fmad(&mut self, a: u32, b: u32, c: u32) -> u32 {
             self.push(Ins::FMad(a, b, c))
+        }
+        fn fcmp(&mut self, c: FCmp, a: u32, b: u32) -> u32 {
+            self.push(Ins::FCmp(c, a, b))
+        }
+        fn is_nan(&mut self, a: u32) -> u32 {
+            self.push(Ins::IsNan(a))
         }
         fn io_load(&mut self, dword: u32) -> u32 {
             self.push(Ins::IoLoad(dword))
@@ -1601,6 +1690,17 @@ pub(crate) mod tests {
                                         FUn::Sat => if a.is_nan() { 0.0 } else { a.clamp(0.0, 1.0) },
                                     }.to_bits())
                                 }
+                                Ins::FCmp(c, a, b) => {
+                                    let (a, b) = (f32::from_bits(g(a)), f32::from_bits(g(b)));
+                                    Some(match c {
+                                        FCmp::Lt => a < b,
+                                        FCmp::Eq => a == b,
+                                        FCmp::Le => a <= b,
+                                        FCmp::Gt => a > b,
+                                        FCmp::Ge => a >= b,
+                                    } as u32)
+                                }
+                                Ins::IsNan(a) => Some(f32::from_bits(g(a)).is_nan() as u32),
                                 // the product rounded first: tests keep to products that are exact
                                 Ins::FMad(a, b, c) => Some((f32::from_bits(g(a)) * f32::from_bits(g(b)) + f32::from_bits(g(c))).to_bits()),
                                 Ins::IoLoad(a) => Some(io[g(a) as usize]),
@@ -1791,6 +1891,45 @@ pub(crate) mod tests {
         ("V_MUL_F32", "ENC_VOP3", &[("VDST", 22), ("SRC0", V + 19), ("SRC1", 242), ("CLAMP", 1)]),
         ("V_MOV_B32", "ENC_VOP1", &[("VDST", 23), ("SRC0", V + 1)]),
         ("V_FMAC_F32", "ENC_VOP3", &[("VDST", 23), ("SRC0", 241), ("SRC1", V + 2), ("ABS", 1)]),
+        ENDPGM,
+    ];
+
+    /// f32 compares of a = v3 (NaN in every fourth lane, 2^lane in the others) with 4.0: all 16
+    /// predicates into s[2k], two with VOP3 abs / neg, then VOPC into VCC and a cndmask of it,
+    /// and v_cmpx narrowing EXEC for a v_mov.
+    pub(crate) const F32_COMPARES: &[I] = &[
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 192), ("VSRC1", 0)]),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 191), ("VSRC1", 1)]),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 151), ("VSRC1", 1)]),
+        ("V_LSHRREV_B32", "ENC_VOP3", &[("VDST", 19), ("SRC0", 129), ("SRC1", 193)]),
+        ("V_AND_B32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 131), ("VSRC1", 0)]),
+        ("V_CMP_EQ_U32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 4)]),
+        ("V_CNDMASK_B32", "ENC_VOP2", &[("VDST", 3), ("SRC0", V + 1), ("VSRC1", 19)]),
+        ("V_CMP_F_F32", "ENC_VOP3", &[("VDST", 0), ("SRC0", V + 3), ("SRC1", 246)]),
+        ("V_CMP_LT_F32", "ENC_VOP3", &[("VDST", 2), ("SRC0", V + 3), ("SRC1", 246)]),
+        ("V_CMP_EQ_F32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V + 3), ("SRC1", 246)]),
+        ("V_CMP_LE_F32", "ENC_VOP3", &[("VDST", 6), ("SRC0", V + 3), ("SRC1", 246)]),
+        ("V_CMP_GT_F32", "ENC_VOP3", &[("VDST", 8), ("SRC0", V + 3), ("SRC1", 246)]),
+        ("V_CMP_LG_F32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 3), ("SRC1", 246)]),
+        ("V_CMP_GE_F32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 3), ("SRC1", 246)]),
+        ("V_CMP_O_F32", "ENC_VOP3", &[("VDST", 14), ("SRC0", V + 3), ("SRC1", 246)]),
+        ("V_CMP_U_F32", "ENC_VOP3", &[("VDST", 16), ("SRC0", V + 3), ("SRC1", 246)]),
+        ("V_CMP_NGE_F32", "ENC_VOP3", &[("VDST", 18), ("SRC0", V + 3), ("SRC1", 246)]),
+        ("V_CMP_NLG_F32", "ENC_VOP3", &[("VDST", 20), ("SRC0", V + 3), ("SRC1", 246)]),
+        ("V_CMP_NGT_F32", "ENC_VOP3", &[("VDST", 22), ("SRC0", V + 3), ("SRC1", 246)]),
+        ("V_CMP_NLE_F32", "ENC_VOP3", &[("VDST", 24), ("SRC0", V + 3), ("SRC1", 246)]),
+        ("V_CMP_NEQ_F32", "ENC_VOP3", &[("VDST", 26), ("SRC0", V + 3), ("SRC1", 246)]),
+        ("V_CMP_NLT_F32", "ENC_VOP3", &[("VDST", 28), ("SRC0", V + 3), ("SRC1", 246)]),
+        ("V_CMP_TRU_F32", "ENC_VOP3", &[("VDST", 30), ("SRC0", V + 3), ("SRC1", 246)]),
+        // -|a| == -4; !(|-2| > -a)
+        ("V_CMP_EQ_F32", "ENC_VOP3", &[("VDST", 32), ("SRC0", V + 3), ("SRC1", 247), ("ABS", 1), ("NEG", 1)]),
+        ("V_CMP_NGT_F32", "ENC_VOP3", &[("VDST", 34), ("SRC0", 245), ("SRC1", V + 3), ("ABS", 1), ("NEG", 2)]),
+        // vcc = a < 4, v6 = vcc ? p : 0; exec = a >= 4, v7 = 1.0 there
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 246)]),
+        ("V_CMP_LT_F32", "ENC_VOPC", &[("SRC0", V + 3), ("VSRC1", 5)]),
+        ("V_CNDMASK_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 128), ("VSRC1", 1)]),
+        ("V_CMPX_GE_F32", "ENC_VOPC", &[("SRC0", V + 3), ("VSRC1", 5)]),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 242)]),
         ENDPGM,
     ];
 
@@ -2187,6 +2326,59 @@ pub(crate) mod tests {
             return;
         }
         agrees_with_hlsl("f32 arithmetic, wave64", F32_ARITHMETIC, true, &[]);
+    }
+
+    #[test]
+    fn f32_compares_with_nan_and_vop3_modifiers() {
+        let preds: [fn(f32, f32) -> bool; 18] = [
+            |_, _| false,
+            |a, b| a < b,
+            |a, b| a == b,
+            |a, b| a <= b,
+            |a, b| a > b,
+            |a, b| a < b || a > b,
+            |a, b| a >= b,
+            |a, b| !a.is_nan() && !b.is_nan(),
+            |a, b| a.is_nan() || b.is_nan(),
+            |a, b| !(a >= b),
+            |a, b| !(a < b || a > b),
+            |a, b| !(a > b),
+            |a, b| !(a <= b),
+            |a, b| !(a == b),
+            |a, b| !(a < b),
+            |_, _| true,
+            |a, _| -a.abs() == -4.0,
+            |a, _| !(2.0 > -a),
+        ];
+        let (s, v) = state(32);
+        let (s, v) = run(F32_COMPARES, false, &s, &v);
+        let a: Vec<f32> = (0..32).map(|l| if l % 4 == 0 { f32::from_bits(0x7FFF_FFFF) } else { 2f32.powi(l) }).collect();
+        let mask = |p: &dyn Fn(f32) -> bool| (0..32).filter(|&l| p(a[l])).fold(0u32, |m, l| m | 1 << l);
+        for (k, p) in preds.iter().enumerate() {
+            assert_eq!(s[2 * k], mask(&|x| p(x, 4.0)), "s{}", 2 * k);
+        }
+        assert_eq!(s[106], mask(&|x| x < 4.0), "vcc");
+        assert_eq!(s[126], mask(&|x| x >= 4.0), "exec");
+        for (l, r) in v.iter().enumerate() {
+            assert_eq!(r[3], a[l].to_bits(), "lane {l}");
+            assert_eq!(r[6], if a[l] < 4.0 { r[1] } else { 0 }, "lane {l}: cndmask");
+            assert_eq!(r[7], if a[l] >= 4.0 { 1f32.to_bits() } else { 0 }, "lane {l}: under v_cmpx");
+        }
+    }
+
+    #[test]
+    fn f32_compares_agree_with_the_hlsl_path_on_the_gpu() {
+        use super::super::{dxc, runner};
+        if runner::adapter().is_err() || dxc::location().is_err() {
+            runner::skip_test(if runner::adapter().is_err() { "no GPU" } else { "no DXC" });
+            return;
+        }
+        agrees_with_hlsl("f32 compares, wave32", F32_COMPARES, false, &[]);
+        if runner::wave64_supported() != Ok(true) {
+            runner::skip_test("no wave64");
+            return;
+        }
+        agrees_with_hlsl("f32 compares, wave64", F32_COMPARES, true, &[]);
     }
 
     #[test]
