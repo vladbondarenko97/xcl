@@ -551,8 +551,11 @@ unsafe extern "system" fn hk_delete_file_w(n: *const u16) -> i32 {
 type FnSetFileInfoByHandle = unsafe extern "system" fn(HANDLE, i32, *const c_void, u32) -> i32;
 static O_SET_FILE_INFO_BY_HANDLE: AtomicUsize = AtomicUsize::new(0);
 
+const FILE_RENAME_INFO_CLASS: i32 = 3;
 const FILE_DISPOSITION_INFO_CLASS: i32 = 4;
 const FILE_DISPOSITION_INFO_EX_CLASS: i32 = 21;
+const FILE_RENAME_INFO_EX_CLASS: i32 = 22;
+const FILE_RENAME_FLAG_REPLACE_IF_EXISTS: u32 = 0x1;
 const FILE_DISPOSITION_FLAG_DELETE: u32 = 0x1;
 const FILE_DISPOSITION_FLAG_ON_CLOSE: u32 = 0x8;
 
@@ -586,10 +589,79 @@ unsafe fn overlay_file_rel(v: &vfs::Vfs, h: HANDLE) -> Option<String> {
     (!rel.is_empty()).then(|| rel.to_string())
 }
 
+/// A rename through a handle (`std::filesystem::rename`). The handle of a game file is its overlay
+/// copy, so the rename moves only the copy: the destination is mapped like MoveFileExW's, and the
+/// old game path is hidden once it succeeds. A name relative to a RootDirectory is passed through.
+unsafe fn rename_by_handle(v: &vfs::Vfs, h: HANDLE, class: i32, info: *const c_void, size: u32, orig: &impl Fn(*const c_void, u32) -> i32) -> i32 {
+    // FILE_RENAME_INFO (x64): ReplaceIfExists / Flags @0, RootDirectory @8, FileNameLength @16, FileName @20
+    const NAME: usize = 20;
+    let b = info as *const u8;
+    let err = GetLastError();
+    if info.is_null() || (size as usize) < NAME {
+        return orig(info, size);
+    }
+    let flags = if class == FILE_RENAME_INFO_EX_CLASS { (b as *const u32).read_unaligned() } else { *b as u32 };
+    let len = (b.add(16) as *const u32).read_unaligned() as usize;
+    if !(b.add(8) as *const HANDLE).read_unaligned().is_null() || len % 2 != 0 || NAME + len > size as usize {
+        return orig(info, size);
+    }
+    let units: Vec<u16> = std::slice::from_raw_parts(b.add(NAME), len).chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    let Some(srel) = overlay_file_rel(v, h) else { return orig(info, size) };
+    let d = String::from_utf16_lossy(&units);
+    let replace_existing = flags & FILE_RENAME_FLAG_REPLACE_IF_EXISTS != 0;
+    let drel = match v.classify(&d) {
+        Target::Game { rel } => Some(rel),
+        _ => None,
+    };
+    if let Some(dr) = &drel {
+        if srel == *dr {
+            return 1;
+        }
+        if srel.to_lowercase() != dr.to_lowercase() {
+            if v.is_dir(dr) {
+                SetLastError(vfs::ERROR_ACCESS_DENIED);
+                return 0;
+            }
+            if !replace_existing && v.exists(dr) {
+                SetLastError(vfs::ERROR_ALREADY_EXISTS);
+                return 0;
+            }
+        }
+    }
+    let rd = match dest_of(v, &d) {
+        Ok((rd, _)) => rd,
+        Err(e) => {
+            SetLastError(e);
+            return 0;
+        }
+    };
+    // the same record with the destination in the overlay
+    let name: Vec<u8> = rd.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let mut buf = vec![0u64; (NAME + name.len() + 8) / 8];
+    let p = buf.as_mut_ptr() as *mut u8;
+    std::ptr::copy_nonoverlapping(b, p, 16);
+    (p.add(16) as *mut u32).write_unaligned(name.len() as u32);
+    std::ptr::copy_nonoverlapping(name.as_ptr(), p.add(NAME), name.len());
+    let ok = orig(p as *const c_void, (NAME + name.len() + 2) as u32);
+    if ok != 0 {
+        if let Some(dr) = &drel {
+            v.commit_write(dr);
+        }
+        if drel.as_ref().is_none_or(|dr| srel.to_lowercase() != dr.to_lowercase()) {
+            v.commit_overlay_removal(&srel);
+        }
+        SetLastError(err);
+    }
+    ok
+}
+
 /// A delete through a handle (`std::filesystem::remove` does it this way). The handle of a game
 /// file is its overlay copy, so the delete removes only the copy: the whiteout is recorded here.
 /// Directories and delete-on-close (FILE_DISPOSITION_FLAG_ON_CLOSE) are passed through.
-unsafe fn set_file_info_vfs(v: &vfs::Vfs, h: HANDLE, class: i32, info: *const c_void, size: u32, orig: impl Fn() -> i32) -> i32 {
+unsafe fn set_file_info_vfs(v: &vfs::Vfs, h: HANDLE, class: i32, info: *const c_void, size: u32, orig: impl Fn(*const c_void, u32) -> i32) -> i32 {
+    if class == FILE_RENAME_INFO_CLASS || class == FILE_RENAME_INFO_EX_CLASS {
+        return rename_by_handle(v, h, class, info, size, &orig);
+    }
     let delete = match class {
         FILE_DISPOSITION_INFO_CLASS if !info.is_null() && size >= 1 => Some(*(info as *const u8) != 0),
         FILE_DISPOSITION_INFO_EX_CLASS if !info.is_null() && size >= 4 => {
@@ -598,12 +670,12 @@ unsafe fn set_file_info_vfs(v: &vfs::Vfs, h: HANDLE, class: i32, info: *const c_
         }
         _ => None,
     };
-    let Some(delete) = delete else { return orig() };
+    let Some(delete) = delete else { return orig(info, size) };
     let err = GetLastError();
     // resolved before the call, while the file's name is certainly still there
     let rel = overlay_file_rel(v, h);
     SetLastError(err);
-    let ok = orig();
+    let ok = orig(info, size);
     if ok != 0 {
         if let Some(rel) = rel {
             let err = GetLastError();
@@ -622,7 +694,7 @@ unsafe fn set_file_info_vfs(v: &vfs::Vfs, h: HANDLE, class: i32, info: *const c_
 unsafe extern "system" fn hk_set_file_info_by_handle(h: HANDLE, class: i32, info: *const c_void, size: u32) -> i32 {
     let orig = orig!(O_SET_FILE_INFO_BY_HANDLE as FnSetFileInfoByHandle);
     let (Some(_g), Some(v)) = (Guard::enter(), vfs::get()) else { return orig(h, class, info, size) };
-    set_file_info_vfs(v, h, class, info, size, || orig(h, class, info, size))
+    set_file_info_vfs(v, h, class, info, size, |i, n| orig(h, class, i, n))
 }
 
 /// Source for a copy/move: (real path to read, game rel if it lives in the game folder).
@@ -1827,7 +1899,7 @@ mod tests {
         use windows_sys::Win32::Storage::FileSystem::SetFileInformationByHandle;
         let (p, n) = (info as *const T as *const c_void, std::mem::size_of::<T>() as u32);
         // SAFETY: `info` is a live, aligned buffer of `n` bytes for the duration of both calls.
-        unsafe { set_file_info_vfs(v, h, class, p, n, || SetFileInformationByHandle(h, class, p, n)) }
+        unsafe { set_file_info_vfs(v, h, class, p, n, |p, n| SetFileInformationByHandle(h, class, p, n)) }
     }
 
     #[test]
@@ -1888,5 +1960,51 @@ mod tests {
         // a failed call returns the native result and error
         assert_eq!(set_info(v, INVALID_HANDLE_VALUE, FILE_DISPOSITION_INFO_CLASS, &1u8), 0);
         assert_eq!(unsafe { GetLastError() }, 6); // ERROR_INVALID_HANDLE
+    }
+
+    /// FileRenameInfo / FileRenameInfoEx for `name` (no RootDirectory), through the hook.
+    fn rename_info(v: &vfs::Vfs, h: HANDLE, class: i32, replace: bool, name: &str) -> i32 {
+        use windows_sys::Win32::Storage::FileSystem::SetFileInformationByHandle;
+        let name: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let mut buf = vec![0u64; (20 + name.len() + 8) / 8];
+        let p = buf.as_mut_ptr() as *mut u8;
+        // SAFETY: `buf` holds the 20-byte header, the name and a NUL; all writes stay inside it.
+        unsafe {
+            *p = replace as u8;
+            (p.add(16) as *mut u32).write_unaligned(name.len() as u32);
+            std::ptr::copy_nonoverlapping(name.as_ptr(), p.add(20), name.len());
+            let n = (20 + name.len() + 2) as u32;
+            set_file_info_vfs(v, h, class, p as *const c_void, n, |p, n| SetFileInformationByHandle(h, class, p, n))
+        }
+    }
+
+    #[test]
+    fn rename_by_handle_hides_the_old_game_path() {
+        let f = HookFixture::new("handle_rename");
+        let v = &f.vfs;
+
+        // FileRenameInfo: the file ends up at the new name only
+        let h = open_for_delete(v, r"G:\data\hello.txt");
+        unsafe { SetLastError(4242) };
+        assert_eq!(rename_info(v, h, FILE_RENAME_INFO_CLASS, false, r"G:\data\moved.txt"), 1);
+        assert_eq!(unsafe { GetLastError() }, 4242, "a successful call leaves the last error alone");
+        assert_ne!(unsafe { CloseHandle(h) }, 0);
+        assert!(v.is_whiteout(r"data\hello.txt"));
+        assert_eq!(f.read_vfs(r"G:\data\hello.txt"), None);
+        assert_eq!(f.read_vfs(r"G:\data\moved.txt"), Some(b"original".to_vec()));
+        assert_eq!(std::fs::read(f.game().join("data").join("hello.txt")).unwrap(), b"original");
+
+        // an existing game destination without ReplaceIfExists is kept, and so is the source
+        let h = open_for_delete(v, r"G:\data\moved.txt");
+        assert_eq!(rename_info(v, h, FILE_RENAME_INFO_CLASS, false, r"G:\data\gone.txt"), 0);
+        assert_eq!(unsafe { GetLastError() }, vfs::ERROR_ALREADY_EXISTS);
+        assert_eq!(f.read_vfs(r"G:\data\gone.txt"), Some(b"bye".to_vec()));
+        assert_eq!(f.read_vfs(r"G:\data\moved.txt"), Some(b"original".to_vec()));
+
+        // FileRenameInfoEx with FILE_RENAME_FLAG_REPLACE_IF_EXISTS replaces it
+        assert_eq!(rename_info(v, h, FILE_RENAME_INFO_EX_CLASS, true, r"G:\data\gone.txt"), 1);
+        assert_ne!(unsafe { CloseHandle(h) }, 0);
+        assert_eq!(f.read_vfs(r"G:\data\gone.txt"), Some(b"original".to_vec()));
+        assert_eq!(f.read_vfs(r"G:\data\moved.txt"), None);
     }
 }
