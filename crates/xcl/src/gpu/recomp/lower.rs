@@ -161,6 +161,7 @@ const F32_ARITH: &[&str] = &[
     "V_CVT_F32_I32", "V_CVT_F32_U32", "V_CVT_U32_F32", "V_CVT_I32_F32", "V_CVT_RPI_I32_F32", "V_CVT_FLR_I32_F32", "V_CVT_F32_F16", "V_CVT_F16_F32",
     "V_RCP_F32", "V_RCP_IFLAG_F32", "V_RSQ_F32", "V_SQRT_F32", "V_EXP_F32", "V_LOG_F32", "V_SIN_F32", "V_COS_F32",
     "V_FLOOR_F32", "V_CEIL_F32", "V_TRUNC_F32", "V_RNDNE_F32", "V_FRACT_F32",
+    "V_FMAMK_F32", "V_FMAAK_F32", "V_MADMK_F32", "V_MADAK_F32", "V_MIN3_F32", "V_MAX3_F32", "V_MED3_F32",
 ];
 const VCC: u8 = 106;
 
@@ -732,7 +733,7 @@ impl<'a, I: Ir> Lower<'a, I> {
             return Ok(self.f32_out(d, vop3, r));
         }
         let n = match name {
-            "V_FMA_F32" | "V_MAD_F32" => 3,
+            "V_FMA_F32" | "V_MAD_F32" | "V_MIN3_F32" | "V_MAX3_F32" | "V_MED3_F32" => 3,
             n if n.starts_with("V_CVT_") => 1,
             "V_RCP_F32" | "V_RCP_IFLAG_F32" | "V_RSQ_F32" | "V_SQRT_F32" | "V_EXP_F32" | "V_LOG_F32" | "V_SIN_F32" | "V_COS_F32" => 1,
             "V_FLOOR_F32" | "V_CEIL_F32" | "V_TRUNC_F32" | "V_RNDNE_F32" | "V_FRACT_F32" => 1,
@@ -751,6 +752,11 @@ impl<'a, I: Ir> Lower<'a, I> {
         }
         if matches!(name, "V_MAC_F32" | "V_FMAC_F32") {
             x.push(self.read(b, Var::V(vdst as u16)));
+        }
+        // the literal K: src0 · K + vsrc1 (…MK), src0 · vsrc1 + K (…AK)
+        if let Some(k) = d.literal.filter(|_| matches!(name, "V_FMAMK_F32" | "V_FMAAK_F32" | "V_MADMK_F32" | "V_MADAK_F32")) {
+            let k = self.ir.int(k);
+            x.insert(if name.ends_with("MK_F32") { 1 } else { 2 }, k);
         }
         // integer results: no output modifiers
         match name {
@@ -792,7 +798,19 @@ impl<'a, I: Ir> Lower<'a, I> {
             "V_MUL_F32" => self.ir.fbin(FBin::Mul, x[0], x[1]),
             "V_MIN_F32" => self.ir.fbin(FBin::Min, x[0], x[1]),
             "V_MAX_F32" => self.ir.fbin(FBin::Max, x[0], x[1]),
-            "V_FMA_F32" | "V_FMAC_F32" => self.ir.fmad(x[0], x[1], x[2]),
+            "V_FMA_F32" | "V_FMAC_F32" | "V_FMAMK_F32" | "V_FMAAK_F32" => self.ir.fmad(x[0], x[1], x[2]),
+            "V_MIN3_F32" | "V_MAX3_F32" => {
+                let op = if name == "V_MIN3_F32" { FBin::Min } else { FBin::Max };
+                let t = self.ir.fbin(op, x[0], x[1]);
+                self.ir.fbin(op, t, x[2])
+            }
+            // `med3f`: max(min(a, b), min(max(a, b), c))
+            "V_MED3_F32" => {
+                let lo = self.ir.fbin(FBin::Min, x[0], x[1]);
+                let hi = self.ir.fbin(FBin::Max, x[0], x[1]);
+                let hi = self.ir.fbin(FBin::Min, hi, x[2]);
+                self.ir.fbin(FBin::Max, lo, hi)
+            }
             // rcp is HLSL's `rcp` (1 / x); sin and cos take turns: x · 2π first, as `emit.rs`
             "V_RCP_F32" | "V_RCP_IFLAG_F32" => {
                 let one = self.ir.int(1.0f32.to_bits());
@@ -2302,6 +2320,27 @@ pub(crate) mod tests {
         ENDPGM,
     ];
 
+    /// v_fmamk / fmaak / madmk / madak (products exact) and min3 / max3 / med3 of a = the lane
+    /// (NaN in every fourth lane), b = lane − 16 and 4.0, one with VOP3 abs / neg.
+    pub(crate) const F32_THREE_SOURCE: &[I] = &[
+        ("V_LSHRREV_B32", "ENC_VOP3", &[("VDST", 19), ("SRC0", 129), ("SRC1", 193)]),
+        ("V_SUBREV_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 144), ("VSRC1", 0)]),
+        ("V_CVT_F32_I32", "ENC_VOP1", &[("VDST", 2), ("SRC0", V + 1)]),
+        ("V_CVT_F32_U32", "ENC_VOP1", &[("VDST", 3), ("SRC0", V)]),
+        ("V_AND_B32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 131), ("VSRC1", 0)]),
+        ("V_CMP_EQ_U32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 4)]),
+        ("V_CNDMASK_B32", "ENC_VOP2", &[("VDST", 5), ("SRC0", V + 3), ("VSRC1", 19)]),
+        ("V_FMAMK_F32", "ENC_VOP2", &[("VDST", 6), ("SRC0", V + 3), ("VSRC1", 2), ("LITERAL", 0x3FC0_0000)]),
+        ("V_FMAAK_F32", "ENC_VOP2", &[("VDST", 7), ("SRC0", V + 3), ("VSRC1", 2), ("LITERAL", 0x3E80_0000)]),
+        ("V_MADMK_F32", "ENC_VOP2", &[("VDST", 8), ("SRC0", V + 3), ("VSRC1", 2), ("LITERAL", 0x3FC0_0000)]),
+        ("V_MADAK_F32", "ENC_VOP2", &[("VDST", 9), ("SRC0", V + 3), ("VSRC1", 2), ("LITERAL", 0x3E80_0000)]),
+        ("V_MIN3_F32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 5), ("SRC1", V + 2), ("SRC2", 246)]),
+        ("V_MAX3_F32", "ENC_VOP3", &[("VDST", 11), ("SRC0", V + 5), ("SRC1", V + 2), ("SRC2", 246)]),
+        ("V_MED3_F32", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 5), ("SRC1", V + 2), ("SRC2", 246)]),
+        ("V_MED3_F32", "ENC_VOP3", &[("VDST", 13), ("SRC0", V + 2), ("SRC1", V + 5), ("SRC2", 246), ("ABS", 1), ("NEG", 2)]),
+        ENDPGM,
+    ];
+
     pub(crate) fn compute_cs() -> crate::gpu::recomp::CsInterface {
         crate::gpu::recomp::CsInterface { threads: [64, 1, 1], user_sgprs: 2, tgid: [true, false, false], tg_size: false, tid_components: 1 }
     }
@@ -2751,6 +2790,36 @@ pub(crate) mod tests {
             return;
         }
         agrees_with_hlsl("f32 conversions, wave64", F32_CONVERSIONS, true, &[]);
+    }
+
+    #[test]
+    fn f32_three_source_ops() {
+        let med3 = |a: f32, b: f32, c: f32| a.min(b).max(a.max(b).min(c));
+        let (s, v) = state(32);
+        let (_, v) = run(F32_THREE_SOURCE, false, &s, &v);
+        for (l, r) in v.iter().enumerate() {
+            let f = |i: usize| f32::from_bits(r[i]);
+            let (x, y) = (l as f32, l as f32 - 16.0);
+            let a = if l % 4 == 0 { f32::from_bits(0x7FFF_FFFF) } else { x };
+            assert_eq!([f(6), f(7), f(8), f(9)], [x * 1.5 + y, x * y + 0.25, x * 1.5 + y, x * y + 0.25], "lane {l}");
+            assert_eq!([f(10), f(11), f(12)], [a.min(y).min(4.0), a.max(y).max(4.0), med3(a, y, 4.0)], "lane {l}");
+            assert_eq!(f(13), med3(y.abs(), -a, 4.0), "lane {l}");
+        }
+    }
+
+    #[test]
+    fn f32_three_source_ops_agree_with_the_hlsl_path_on_the_gpu() {
+        use super::super::{dxc, runner};
+        if runner::adapter().is_err() || dxc::location().is_err() {
+            runner::skip_test(if runner::adapter().is_err() { "no GPU" } else { "no DXC" });
+            return;
+        }
+        agrees_with_hlsl("f32 three-source, wave32", F32_THREE_SOURCE, false, &[]);
+        if runner::wave64_supported() != Ok(true) {
+            runner::skip_test("no wave64");
+            return;
+        }
+        agrees_with_hlsl("f32 three-source, wave64", F32_THREE_SOURCE, true, &[]);
     }
 
     #[test]

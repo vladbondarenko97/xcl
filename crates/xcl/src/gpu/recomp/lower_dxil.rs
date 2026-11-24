@@ -316,7 +316,7 @@ mod tests {
         if !gpu() {
             return;
         }
-        for (name, lines) in [("straight", STRAIGHT), ("skipped if", SKIPPED_IF), ("leaving loop", LEAVING_LOOP), ("uniform loop", UNIFORM_LOOP), ("memory", MEMORY), ("f32 arithmetic", F32_ARITHMETIC), ("f32 compares", F32_COMPARES), ("f32 conversions", F32_CONVERSIONS), ("f32 rounding", F32_ROUNDING)] {
+        for (name, lines) in [("straight", STRAIGHT), ("skipped if", SKIPPED_IF), ("leaving loop", LEAVING_LOOP), ("uniform loop", UNIFORM_LOOP), ("memory", MEMORY), ("f32 arithmetic", F32_ARITHMETIC), ("f32 compares", F32_COMPARES), ("f32 conversions", F32_CONVERSIONS), ("f32 rounding", F32_ROUNDING), ("f32 three-source", F32_THREE_SOURCE)] {
             let insts = decode(lines);
             let (dxil, stale) = super::kernel(&insts, false).unwrap_or_else(|e| panic!("{name}: {e}"));
             let (s, v) = state(32);
