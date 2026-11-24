@@ -2104,6 +2104,183 @@ pub(crate) mod tests {
         ENDPGM,
     ];
 
+    // f16 and packed programs, as the f32 ones: `lower_dxil`'s `f16_programs_on_the_gpu` checks
+    // the HLSL path's registers with the `check_f16_*` below and compares the per-lane form with it
+
+    /// f16 VOP1 / VOP2 / VOP3 on x = 1 + lane · 2^-10 (v1, and v6's low half; v6's high half is
+    /// −2 − lane · 2^-9): ties to even, denormal results and their ties, overflow, a fused fma
+    /// just below a tie (lane 1), NaN into min / max / med3, OP_SEL halves, omod and clamp, and
+    /// f16 ↔ i16 / u16.
+    pub(crate) const F16_ARITHMETIC: &[I] = &[
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 255), ("VSRC1", 0), ("LITERAL", 0x3C00)]),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 255), ("VSRC1", 0), ("LITERAL", 0xC000)]),
+        ("V_LSHL_OR_B32", "ENC_VOP3", &[("VDST", 6), ("SRC0", V + 6), ("SRC1", 144), ("SRC2", V + 1)]),
+        // v2 = 2^-11, v3 = 2^-15 (a denormal), v4 = 65504, v5 = NaN, v7 = 2^-11 · (1 − 2^-10)
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 255), ("LITERAL", 0x1000)]),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 255), ("LITERAL", 0x0200)]),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 255), ("LITERAL", 0x7BFF)]),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 255), ("LITERAL", 0x7E00)]),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 255), ("LITERAL", 0x0FFE)]),
+        // x + 2^-11, 2^-11 − x (ties), x · 2^-15 (denormal ties), x · 65504 (∞ from lane 1),
+        // fma(x, v7, x)
+        ("V_ADD_F16", "ENC_VOP2", &[("VDST", 8), ("SRC0", V + 1), ("VSRC1", 2)]),
+        ("V_SUB_F16", "ENC_VOP2", &[("VDST", 9), ("SRC0", V + 2), ("VSRC1", 1)]),
+        ("V_MUL_F16", "ENC_VOP2", &[("VDST", 10), ("SRC0", V + 1), ("VSRC1", 3)]),
+        ("V_MUL_F16", "ENC_VOP2", &[("VDST", 11), ("SRC0", V + 1), ("VSRC1", 4)]),
+        ("V_FMA_F16", "ENC_VOP3", &[("VDST", 12), ("SRC0", V + 1), ("SRC1", V + 7), ("SRC2", V + 1)]),
+        // min(NaN, x), max(x, −NaN); v15's high half = v6's + x, its low half kept
+        ("V_MIN_F16", "ENC_VOP2", &[("VDST", 13), ("SRC0", V + 5), ("VSRC1", 1)]),
+        ("V_MAX_F16", "ENC_VOP3", &[("VDST", 14), ("SRC0", V + 1), ("SRC1", V + 5), ("NEG", 2)]),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 15), ("SRC0", V)]),
+        ("V_ADD_F16", "ENC_VOP3", &[("VDST", 15), ("SRC0", V + 6), ("SRC1", V + 1), ("OP_SEL", 9)]),
+        // omod: (x · 0.5) · 2, (x · x − 1) · 4; clamp of 65504 · 2
+        ("V_MUL_F16", "ENC_VOP3", &[("VDST", 16), ("SRC0", V + 1), ("SRC1", 240), ("OMOD", 1)]),
+        ("V_FMA_F16", "ENC_VOP3", &[("VDST", 17), ("SRC0", V + 1), ("SRC1", V + 1), ("SRC2", 243), ("OMOD", 2)]),
+        ("V_MUL_F16", "ENC_VOP3", &[("VDST", 18), ("SRC0", V + 4), ("SRC1", 244), ("CLAMP", 1)]),
+        // ldexp(x, −lane): denormals and their ties from lane 15, 0 from lane 26
+        ("V_SUB_NC_U32", "ENC_VOP2", &[("VDST", 20), ("SRC0", 128), ("VSRC1", 0)]),
+        ("V_LDEXP_F16", "ENC_VOP2", &[("VDST", 19), ("SRC0", V + 1), ("VSRC1", 20)]),
+        // fract of v6's high half; q = (lane − 16) / 2 into rndne (ties, −0 at lane 15), i16, u16;
+        // u16 2049 · lane into f16 (a tie at lane 16)
+        ("V_FRACT_F16", "ENC_VOP3", &[("VDST", 22), ("SRC0", V + 6), ("OP_SEL", 1)]),
+        ("V_SUBREV_NC_U32", "ENC_VOP2", &[("VDST", 25), ("SRC0", 144), ("VSRC1", 0)]),
+        ("V_CVT_F16_I16", "ENC_VOP1", &[("VDST", 24), ("SRC0", V + 25)]),
+        ("V_MUL_F16", "ENC_VOP2", &[("VDST", 26), ("SRC0", 240), ("VSRC1", 24)]),
+        ("V_RNDNE_F16", "ENC_VOP1", &[("VDST", 23), ("SRC0", V + 26)]),
+        ("V_CVT_I16_F16", "ENC_VOP1", &[("VDST", 27), ("SRC0", V + 26)]),
+        ("V_CVT_U16_F16", "ENC_VOP1", &[("VDST", 28), ("SRC0", V + 26)]),
+        ("V_LSHL_OR_B32", "ENC_VOP3", &[("VDST", 30), ("SRC0", V), ("SRC1", 139), ("SRC2", V)]),
+        ("V_CVT_F16_U16", "ENC_VOP1", &[("VDST", 29), ("SRC0", V + 30)]),
+        // med3(NaN, x, 2); fmac v32 = x · 2^-11 + x
+        ("V_MED3_F16", "ENC_VOP3", &[("VDST", 31), ("SRC0", V + 5), ("SRC1", V + 1), ("SRC2", 244)]),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 32), ("SRC0", V + 1)]),
+        ("V_FMAC_F16", "ENC_VOP2", &[("VDST", 32), ("SRC0", V + 1), ("VSRC1", 2)]),
+        ENDPGM,
+    ];
+
+    /// VOP3P packed math on v1 = x | y << 16 (x, y as in `F16_ARITHMETIC`), v2 = 2^-11 | 2^-15 << 16,
+    /// v3 = NaN | 65504 << 16 and the u16 / i16 pairs v4 = 2049 · lane | (0xFFFF − lane) << 16,
+    /// v5 = (0x8000 + lane << 10) | (0x7FF0 + lane) << 16: OP_SEL / OP_SEL_HI picking swapped and
+    /// broadcast halves, NEG / NEG_HI, clamp (f16, and saturating u16 / i16), and
+    /// v_cvt_pkrtz_f16_f32 (toward zero, 65504 for the out-of-range ones).
+    pub(crate) const F16_PACKED: &[I] = &[
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 1), ("SRC0", 255), ("VSRC1", 0), ("LITERAL", 0x3C00)]),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 9), ("SRC0", 255), ("VSRC1", 0), ("LITERAL", 0xC000)]),
+        ("V_LSHL_OR_B32", "ENC_VOP3", &[("VDST", 1), ("SRC0", V + 9), ("SRC1", 144), ("SRC2", V + 1)]),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 255), ("LITERAL", 0x0200_1000)]),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 255), ("LITERAL", 0x7BFF_7E00)]),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 255), ("LITERAL", 0x0FFE_0FFE)]),
+        ("V_LSHL_OR_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V), ("SRC1", 139), ("SRC2", V)]),
+        ("V_SUB_NC_U32", "ENC_VOP2", &[("VDST", 11), ("SRC0", 255), ("VSRC1", 0), ("LITERAL", 0xFFFF)]),
+        ("V_LSHL_OR_B32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V + 11), ("SRC1", 144), ("SRC2", V + 10)]),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 12), ("SRC0", 138), ("VSRC1", 0)]),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 12), ("SRC0", 255), ("VSRC1", 12), ("LITERAL", 0x8000)]),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 13), ("SRC0", 255), ("VSRC1", 0), ("LITERAL", 0x7FF0)]),
+        ("V_LSHL_OR_B32", "ENC_VOP3", &[("VDST", 5), ("SRC0", V + 13), ("SRC1", 144), ("SRC2", V + 12)]),
+        // v1 + v2; v1.hi · v2.lo | v1.lo · v2.hi; fma(v1, v7, v1) (v7 as in `F16_ARITHMETIC`)
+        ("V_PK_ADD_F16", "ENC_VOP3P", &[("VDST", 14), ("SRC0", V + 1), ("SRC1", V + 2), ("OP_SEL_HI", 3)]),
+        ("V_PK_MUL_F16", "ENC_VOP3P", &[("VDST", 15), ("SRC0", V + 1), ("SRC1", V + 2), ("OP_SEL", 1), ("OP_SEL_HI", 2)]),
+        ("V_PK_FMA_F16", "ENC_VOP3P", &[("VDST", 16), ("SRC0", V + 1), ("SRC1", V + 7), ("SRC2", V + 1), ("OP_SEL_HI", 3), ("OP_SEL_HI_2", 1)]),
+        // min(v3, v1), max(v1, −v3), v1 + (−lo | hi of v1's high half), clamp(v3.hi · v1)
+        ("V_PK_MIN_F16", "ENC_VOP3P", &[("VDST", 17), ("SRC0", V + 3), ("SRC1", V + 1), ("OP_SEL_HI", 3)]),
+        ("V_PK_MAX_F16", "ENC_VOP3P", &[("VDST", 18), ("SRC0", V + 1), ("SRC1", V + 3), ("OP_SEL_HI", 3), ("NEG", 2), ("NEG_HI", 2)]),
+        ("V_PK_ADD_F16", "ENC_VOP3P", &[("VDST", 19), ("SRC0", V + 1), ("SRC1", V + 1), ("OP_SEL_HI", 3), ("NEG_HI", 1)]),
+        ("V_PK_MUL_F16", "ENC_VOP3P", &[("VDST", 20), ("SRC0", V + 3), ("SRC1", V + 1), ("OP_SEL", 1), ("OP_SEL_HI", 3), ("CLAMP", 1)]),
+        // u16 / i16: wrapping, saturating (clamp), v4.lo · v5.hi | v4.hi · v5.hi, v4 · v4 + v5
+        ("V_PK_ADD_U16", "ENC_VOP3P", &[("VDST", 21), ("SRC0", V + 4), ("SRC1", V + 5), ("OP_SEL_HI", 3)]),
+        ("V_PK_ADD_U16", "ENC_VOP3P", &[("VDST", 22), ("SRC0", V + 4), ("SRC1", V + 5), ("OP_SEL_HI", 3), ("CLAMP", 1)]),
+        ("V_PK_SUB_U16", "ENC_VOP3P", &[("VDST", 23), ("SRC0", V + 4), ("SRC1", V + 5), ("OP_SEL_HI", 3), ("CLAMP", 1)]),
+        ("V_PK_ADD_I16", "ENC_VOP3P", &[("VDST", 24), ("SRC0", V + 5), ("SRC1", V + 5), ("OP_SEL_HI", 3), ("CLAMP", 1)]),
+        ("V_PK_SUB_I16", "ENC_VOP3P", &[("VDST", 25), ("SRC0", V + 4), ("SRC1", V + 5), ("OP_SEL_HI", 3)]),
+        ("V_PK_MUL_LO_U16", "ENC_VOP3P", &[("VDST", 26), ("SRC0", V + 4), ("SRC1", V + 5), ("OP_SEL", 2), ("OP_SEL_HI", 3)]),
+        ("V_PK_MAD_U16", "ENC_VOP3P", &[("VDST", 27), ("SRC0", V + 4), ("SRC1", V + 4), ("SRC2", V + 5), ("OP_SEL_HI", 3), ("OP_SEL_HI_2", 1)]),
+        // pkrtz of 1 + lane · 2^-11 and of 65520 + 16 · lane (f32)
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 31), ("SRC0", 140), ("VSRC1", 0)]),
+        ("V_OR_B32", "ENC_VOP2", &[("VDST", 29), ("SRC0", 255), ("VSRC1", 31), ("LITERAL", 0x3F80_0000)]),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 30), ("SRC0", 255), ("VSRC1", 31), ("LITERAL", 0x477F_F000)]),
+        ("V_CVT_PKRTZ_F16_F32", "ENC_VOP2", &[("VDST", 28), ("SRC0", V + 29), ("VSRC1", 30)]),
+        ENDPGM,
+    ];
+
+    /// binary16 of an f64 (exact: an f16 sum or product), rounded to nearest even: denormals,
+    /// and ∞ past 65504
+    pub(crate) fn f16_bits(x: f64) -> u32 {
+        let s = (x.is_sign_negative() as u32) << 15;
+        let a = x.abs();
+        if a.is_infinite() {
+            return s | 0x7C00;
+        }
+        let e = ((a.to_bits() >> 52) as i32 - 1023).max(-14);
+        let q = (a * 2f64.powi(10 - e)).round_ties_even() as u32;
+        s | ((e + 14) as u32 * 1024 + q).min(0x7C00)
+    }
+
+    pub(crate) fn check_f16_arithmetic(_: &[u32], v: &[Vec<u32>]) {
+        let h = |b: u32| f16_to_f32(b & 0xFFFF) as f64;
+        let p = |e: i32| 2f64.powi(e);
+        for (l, r) in v.iter().enumerate() {
+            let (x, y) = (0x3C00 + l as u32, 0xC000 + l as u32);
+            let (fx, fy, q) = (h(x), h(y), (l as f64 - 16.0) / 2.0);
+            assert_eq!((r[1], r[6]), (x, y << 16 | x), "lane {l}");
+            // v8, v9, v12, v17, v19, v29 and v32 round to nearest even on the console (MODE.FP_ROUND
+            // = 0) and the HLSL path gives them rounded toward zero on NVIDIA (`f32tof16`, whose
+            // rounding the driver picks), so they are left to the per-lane comparison
+            let want = [
+                (10, f16_bits(fx * p(-15))),
+                (11, f16_bits(fx * 65504.0)),
+                (13, x),
+                (14, x),
+                (15, f16_bits(fy + fx) << 16 | l as u32),
+                (16, x),
+                (18, 0x3C00),
+                (22, f16_bits(fy - fy.floor())),
+                (23, f16_bits(q.round_ties_even())),
+                (24, f16_bits(l as f64 - 16.0)),
+                (26, f16_bits(q)),
+                (27, q as i32 as u32 & 0xFFFF),
+                (28, q as u32),
+                (31, x),
+            ];
+            for (i, w) in want {
+                assert_eq!(r[i], w, "lane {l} v{i}: {:#x} against {w:#x}", r[i]);
+            }
+        }
+    }
+
+    pub(crate) fn check_f16_packed(_: &[u32], v: &[Vec<u32>]) {
+        let h = |b: u32| f16_to_f32(b & 0xFFFF) as f64;
+        let p = |e: i32| 2f64.powi(e);
+        let pk = |lo: u32, hi: u32| lo & 0xFFFF | hi << 16;
+        let i16s = |a: u32| a as u16 as i16 as i32;
+        let sat = |a: i32| a.clamp(-32768, 32767) as u32;
+        for (l, r) in v.iter().enumerate() {
+            let n = l as u32;
+            let (x, y) = (0x3C00 + n, 0xC000 + n);
+            let (fx, fy) = (h(x), h(y));
+            let (a0, a1, c0, c1) = (2049 * n, 0xFFFF - n, 0x8000 + (n << 10), 0x7FF0 + n);
+            assert_eq!((r[1], r[4], r[5]), (pk(x, y), pk(a0, a1), pk(c0, c1)), "lane {l}");
+            // v14 and v16 as v8 and v12 of `check_f16_arithmetic`
+            let want = [
+                (15, pk(f16_bits(fy * p(-11)), f16_bits(fx * p(-15)))),
+                (17, pk(x, y)),
+                (18, pk(x, y)),
+                (19, pk(f16_bits(2.0 * fx), 0)),
+                (20, pk(0x3C00, 0)),
+                (21, pk(a0 + c0, a1 + c1)),
+                (22, pk((a0 + c0).min(0xFFFF), (a1 + c1).min(0xFFFF))),
+                (23, pk(a0.saturating_sub(c0), a1.saturating_sub(c1))),
+                (24, pk(sat(2 * i16s(c0)), sat(2 * i16s(c1)))),
+                (25, pk(a0.wrapping_sub(c0), a1.wrapping_sub(c1))),
+                (26, pk(a0 * c1, a1 * c1)),
+                (27, pk(a0 * a0 + c0, a1 * a1 + c1)),
+                (28, pk(0x3C00 + n / 2, 0x7BFF)),
+            ];
+            for (i, w) in want {
+                assert_eq!(r[i], w, "lane {l} v{i}: {:#x} against {w:#x}", r[i]);
+            }
+        }
+    }
+
     pub(crate) fn check_f32_arithmetic(_: &[u32], v: &[Vec<u32>]) {
         let sat = |x: f32| x.clamp(0.0, 1.0);
         for (l, r) in v.iter().enumerate() {
