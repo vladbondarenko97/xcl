@@ -422,7 +422,7 @@ impl RecompAgg {
                 self.cs_forms[5] += b.len();
             }
             if let Err(e) = &lane {
-                let key: String = e.split([':', '(']).next().unwrap_or("").split_whitespace().take(3).collect::<Vec<_>>().join(" ");
+                let key: String = e.split([':', '(']).next().unwrap_or("").split_whitespace().take(5).collect::<Vec<_>>().join(" ");
                 *self.cs_lane_why.entry(key).or_default() += 1;
             }
         }

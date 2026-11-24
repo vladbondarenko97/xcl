@@ -472,6 +472,10 @@ impl<'a, I: Ir> Lower<'a, I> {
             // MODE (float rounding / denormals): only float instructions read it, and the
             // lowering refuses every float instruction so far – revisit when floats come in
             "S_SETREG_IMM32_B32" | "S_SETREG_B32" if self.sets_mode_only(d) => {}
+            "S_SETREG_IMM32_B32" | "S_SETREG_B32" => {
+                let s = fv("SIMM16").unwrap_or(0);
+                return Err(format!("unsupported {name} hwreg {} offset {} size {}", s & 0x3F, (s >> 6) & 0x1F, ((s >> 11) & 0x1F) + 1));
+            }
             n => return Err(format!("unsupported {n}")),
         }
         Ok(())
