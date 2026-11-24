@@ -2167,6 +2167,7 @@ mod tests {
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
                 buffers: FxHashMap::default(),
+                pending: Vec::new(),
                 to_zero: Vec::new(),
                 staging: None,
                 ring_write: 0,
